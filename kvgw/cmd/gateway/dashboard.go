@@ -86,6 +86,10 @@ const dashboardHTML = `<!doctype html>
   #oplog .bad{color:var(--bad)}
   #oplog .warn{color:var(--amber)}
   .valhex{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+  .rpills{display:flex;flex-wrap:wrap;gap:6px}
+  .inspect pre{background:#0b0d10;border:1px solid var(--line);border-radius:3px;padding:8px 10px;
+    overflow:auto;font-size:12px;color:var(--phosphor);margin:6px 0 0;white-space:pre;max-height:220px}
+  .node button{padding:4px 9px;font-size:10px;margin-top:8px}
   @media(max-width:800px){
     .split{grid-template-columns:1fr}
     .row{flex-direction:column;align-items:stretch}
@@ -176,6 +180,7 @@ const dashboardHTML = `<!doctype html>
       <div class="row" style="margin-bottom:10px">
         <input id="filter" placeholder="prefix filter (GET /scan?prefix=)" />
         <button id="hexbtn" class="ghost">values: utf-8</button>
+        <button id="rmprefix" class="amber">delete prefix</button>
       </div>
       <table><thead><tr><th>key</th><th>value</th><th>version</th><th>replicas</th><th>expires</th></tr></thead>
       <tbody id="keys"></tbody></table>
@@ -233,6 +238,28 @@ const dashboardHTML = `<!doctype html>
     }catch(e){return String(s);}
   }
   function showVal(v){ return hexMode ? toHex(v) : String(v==null?'':v); }
+  function prettyJSON(v){
+    if(v==null) return null;
+    var s=String(v).trim();
+    if(!s) return null;
+    var c=s.charAt(0);
+    if(c!=='{' && c!=='[') return null;
+    try{ return JSON.stringify(JSON.parse(s), null, 2); }catch(e){ return null; }
+  }
+  function currentPrefix(){
+    var q=(el('filter').value||'').trim();
+    if(q.slice(-1)==='*') q=q.slice(0,-1);
+    return q;
+  }
+  function fetchRoute(key){
+    if(!key) return;
+    jget('/route/'+encodeURIComponent(key)).then(function(o){
+      if(selected && selected.key===key){
+        selected.route=o.replicas||[];
+        renderInspect();
+      }
+    }).catch(function(){});
+  }
   function expLabel(e){
     if(!e || !e.expires_at){return '—';}
     var sec=e.expires_at-Math.floor(Date.now()/1000);
@@ -276,11 +303,23 @@ const dashboardHTML = `<!doctype html>
       return;
     }
     var exp=selected.expires_at?String(selected.expires_at)+' ('+expLabel(selected)+')':'never';
+    var json=(!hexMode)?prettyJSON(selected.value):null;
+    var valHtml;
+    if(json){
+      valHtml='<pre>'+esc(json)+'</pre>';
+    }else{
+      valHtml='<span class="'+(hexMode?'valhex':'')+'">'+esc(showVal(selected.value))+'</span>';
+    }
+    var pills=(selected.route||[]).map(function(a){
+      return '<span class="pill ok">'+esc(a)+'</span>';
+    }).join('');
+    if(!pills) pills='<span class="muted">—</span>';
     body.innerHTML='<dl>'+
       '<dt>key</dt><dd>'+esc(selected.key)+'</dd>'+
-      '<dt>value</dt><dd class="'+(hexMode?'valhex':'')+'">'+esc(showVal(selected.value))+'</dd>'+
+      '<dt>value</dt><dd>'+valHtml+'</dd>'+
       '<dt>version</dt><dd>v'+esc(selected.version)+'</dd>'+
       '<dt>replicas</dt><dd>'+esc(selected.replicas)+'</dd>'+
+      '<dt>route</dt><dd class="rpills">'+pills+'</dd>'+
       '<dt>expiry</dt><dd>'+esc(exp)+'</dd>'+
       '<dt>watch</dt><dd class="muted">re-get each refresh</dd>'+
       '</dl>';
@@ -298,11 +337,12 @@ const dashboardHTML = `<!doctype html>
     if(row.version!=null) el('cas').value=String(row.version);
   }
   function selectRow(row, fromClick){
-    selected=row?{key:row.key,value:row.value,version:row.version,replicas:row.replicas,expires_at:row.expires_at}:null;
+    selected=row?{key:row.key,value:row.value,version:row.version,replicas:row.replicas,expires_at:row.expires_at,route:row.route||[]}:null;
     watchVer=selected?String(selected.version):null;
     if(fromClick) loadFields(selected);
     renderKeys();
     renderInspect();
+    if(selected) fetchRoute(selected.key);
   }
   function renderKeys(){
     var q=(el('filter').value||'').trim().toLowerCase();
@@ -383,16 +423,27 @@ const dashboardHTML = `<!doctype html>
         var bar=cap?('<div class="bar" title="load '+pct+'% of '+cap+'"><i style="width:'+pct+'%"></i></div>'+
           '<div class="nm">load '+pct+'% · cap '+cap+'</div>'):'';
         var hintLine=hints?('<div class="nm hint">pending hints '+hints+'</div>'):('<div class="nm">pending hints 0</div>');
+        var forced=!!n.forced;
+        var faultLabel=forced?'heal':'fault';
+        var faultDown=forced?'0':'1';
+        var forcedLine=forced?'<div class="nm hint">forced down</div>':'';
         return '<div class="node '+(down?'down':'up')+'"><div class="nh"><span class="dot"></span>'+esc(n.addr)+'</div>'+
           '<div class="nm">'+(n.up?('keys '+n.count+' · tombs '+tombs+' · max v'+n.max_version):('offline'))+'</div>'+
-          '<div class="nm">'+esc(last)+'</div>'+hintLine+bar+'</div>';
+          '<div class="nm">'+esc(last)+'</div>'+hintLine+forcedLine+bar+
+          '<button class="'+(forced?'amber':'ghost')+' fault" data-addr="'+esc(n.addr)+'" data-down="'+faultDown+'">'+faultLabel+'</button></div>';
       }).join('');
       var m=h.metrics||{};
+      function fmtMs(v){
+        var n=Number(v||0);
+        if(!isFinite(n)) n=0;
+        return n>=10?n.toFixed(1):n.toFixed(2);
+      }
       var cells=[['reads',m.gets],['writes',m.puts],['deletes',m.dels],['crdt ops',m.mutations],
         ['quorum fails',m.quorum_failures],['read-repairs',m.read_repairs],['sweep-repairs',m.sweep_repairs],
-        ['hints stored',m.hints_stored],['hints replayed',m.hints_replayed],['compacts',m.compacts]];
+        ['hints stored',m.hints_stored],['hints replayed',m.hints_replayed],['compacts',m.compacts],
+        ['prefix dels',m.prefix_deletes],['get ms',fmtMs(m.latency_get_ms)],['put ms',fmtMs(m.latency_put_ms)]];
       el('metrics').innerHTML=cells.map(function(c){
-        return '<div class="metric"><div class="k">'+c[0]+'</div><div class="v">'+(c[1]||0)+'</div></div>';
+        return '<div class="metric"><div class="k">'+c[0]+'</div><div class="v">'+(c[1]==null?0:c[1])+'</div></div>';
       }).join('');
       var total=(m.gets||0)+(m.puts||0)+(m.dels||0)+(m.mutations||0)+(m.compacts||0);
       if(lastTotal!==null){
@@ -404,6 +455,7 @@ const dashboardHTML = `<!doctype html>
     }).catch(function(){el('healthy').textContent='gateway unreachable';el('healthy').className='pill bad';});
     fetchKeys();
     watchSelected();
+    if(selected && selected.key) fetchRoute(selected.key);
   }
   function doPut(){var k=el('k').value,v=el('v').value;if(!k){return;}
     var hdrs={};
@@ -452,6 +504,31 @@ const dashboardHTML = `<!doctype html>
       msg('route '+k+' → '+d);
       logOp('route', 200, k+' → '+d);
     });}
+  function doRmPrefix(){
+    var q=currentPrefix();
+    var label=q?('prefix "'+q+'"'):'ALL keys';
+    if(!confirm('Delete all keys matching '+label+'?')) return;
+    fetch('/scan?prefix='+encodeURIComponent(q),{method:'DELETE'}).then(function(r){
+      return r.json().then(function(j){
+        var d='deleted '+(j.deleted||0)+(j.error?(' · '+j.error):'');
+        msg('prefix delete → '+r.status+' · '+d);
+        logOp('rm-prefix', r.status, d);
+        selected=null; watchVer=null;
+        refresh();
+      }).catch(function(){msg('prefix delete → '+r.status);logOp('rm-prefix', r.status, '');});
+    });
+  }
+  function doFault(addr, down){
+    if(!addr) return;
+    fetch('/admin/fault?addr='+encodeURIComponent(addr)+'&down='+down,{method:'POST'}).then(function(r){
+      return r.json().then(function(j){
+        var d=(j.addr||addr)+' forced='+(j.forced||j.down);
+        msg('fault → '+r.status+' · '+d);
+        logOp('fault', r.status, d);
+        refresh();
+      }).catch(function(){msg('fault → '+r.status);logOp('fault', r.status, addr);});
+    });
+  }
   function doCompact(){
     fetch('/admin/compact',{method:'POST'}).then(function(r){return r.json().then(function(j){
       var d='compacted '+(j.compacted||0)+(j.errors&&j.errors.length?(' · errs '+j.errors.join('; ')): '');
@@ -500,6 +577,12 @@ const dashboardHTML = `<!doctype html>
   el('del').addEventListener('click',doDel);
   el('route').addEventListener('click',doRoute);
   el('compact').addEventListener('click',doCompact);
+  el('rmprefix').addEventListener('click',doRmPrefix);
+  el('nodes').addEventListener('click',function(ev){
+    var btn=ev.target.closest('button.fault');
+    if(!btn) return;
+    doFault(btn.getAttribute('data-addr'), btn.getAttribute('data-down'));
+  });
   el('export').addEventListener('click',doExport);
   el('importBtn').addEventListener('click',function(){el('importFile').click();});
   el('importFile').addEventListener('change',function(){if(this.files&&this.files[0]){doImport(this.files[0]);this.value='';}});

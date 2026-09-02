@@ -434,6 +434,28 @@ int kv_scan(kv_db *db, kv_scan_cb cb, void *ctx) {
     return KV_OK;
 }
 
+int kv_scan_prefix(kv_db *db, const void *prefix, uint32_t plen,
+                   kv_scan_cb cb, void *ctx) {
+    if (!db || !cb) return KV_ERROR;
+    if (plen == 0) return kv_scan(db, cb, ctx);
+    if (!prefix) return KV_ERROR;
+
+    uint32_t cap = db->hdr->capacity;
+    for (uint32_t i = 0; i < cap; i++) {
+        struct slot *s = &db->slots[i];
+        if (s->state == SLOT_OCCUPIED && slot_expired(db, s)) {
+            lazy_tombstone(db, s);
+        }
+        if (s->state != SLOT_OCCUPIED) continue;
+        if (s->key_len < plen) continue;
+        if (memcmp(s->key, prefix, plen) != 0) continue;
+        int rc = cb(s->key, s->key_len, s->value, s->value_len,
+                    s->version, s->expires_at, ctx);
+        if (rc != 0) return rc;
+    }
+    return KV_OK;
+}
+
 int kv_scan_all(kv_db *db, kv_scan_all_cb cb, void *ctx) {
     if (!db || !cb) return KV_ERROR;
     uint32_t cap = db->hdr->capacity;

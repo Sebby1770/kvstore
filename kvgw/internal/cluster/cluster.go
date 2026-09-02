@@ -50,6 +50,7 @@ type membership struct {
 type hbState struct {
 	down   bool
 	lastOK time.Time
+	forced bool // operator fault inject; heartbeat must not clear down
 }
 
 type Cluster struct {
@@ -75,23 +76,59 @@ type Cluster struct {
 	mQuorumFails, mRepairs, mSweepReps uint64
 	mHintsStored, mHintsReplayed       uint64
 	mCompacts                          uint64
+	mPrefixDeletes                     uint64
+
+	latMu                  sync.Mutex
+	latGetMs, latPutMs     float64
+	latGetInit, latPutInit bool
 }
 
 // Metrics is a snapshot of the coordinator's operational counters.
 type Metrics struct {
-	Gets           uint64 `json:"gets"`
-	Puts           uint64 `json:"puts"`
-	Dels           uint64 `json:"dels"`
-	Mutations      uint64 `json:"mutations"`
-	QuorumFailures uint64 `json:"quorum_failures"`
-	ReadRepairs    uint64 `json:"read_repairs"`
-	SweepRepairs   uint64 `json:"sweep_repairs"`
-	HintsStored    uint64 `json:"hints_stored"`
-	HintsReplayed  uint64 `json:"hints_replayed"`
-	Compacts       uint64 `json:"compacts"`
+	Gets           uint64  `json:"gets"`
+	Puts           uint64  `json:"puts"`
+	Dels           uint64  `json:"dels"`
+	Mutations      uint64  `json:"mutations"`
+	QuorumFailures uint64  `json:"quorum_failures"`
+	ReadRepairs    uint64  `json:"read_repairs"`
+	SweepRepairs   uint64  `json:"sweep_repairs"`
+	HintsStored    uint64  `json:"hints_stored"`
+	HintsReplayed  uint64  `json:"hints_replayed"`
+	Compacts       uint64  `json:"compacts"`
+	PrefixDeletes  uint64  `json:"prefix_deletes"`
+	LatencyGetMs   float64 `json:"latency_get_ms"`
+	LatencyPutMs   float64 `json:"latency_put_ms"`
+}
+
+const latencyEWMAAlpha = 0.2
+
+func ewma(dst *float64, inited *bool, sample float64) {
+	if !*inited {
+		*dst = sample
+		*inited = true
+		return
+	}
+	*dst = latencyEWMAAlpha*sample + (1-latencyEWMAAlpha)*(*dst)
+}
+
+func (c *Cluster) observeGet(d time.Duration) {
+	ms := float64(d) / float64(time.Millisecond)
+	c.latMu.Lock()
+	ewma(&c.latGetMs, &c.latGetInit, ms)
+	c.latMu.Unlock()
+}
+
+func (c *Cluster) observePut(d time.Duration) {
+	ms := float64(d) / float64(time.Millisecond)
+	c.latMu.Lock()
+	ewma(&c.latPutMs, &c.latPutInit, ms)
+	c.latMu.Unlock()
 }
 
 func (c *Cluster) Metrics() Metrics {
+	c.latMu.Lock()
+	getMs, putMs := c.latGetMs, c.latPutMs
+	c.latMu.Unlock()
 	return Metrics{
 		Gets:           atomic.LoadUint64(&c.mGets),
 		Puts:           atomic.LoadUint64(&c.mPuts),
@@ -103,6 +140,9 @@ func (c *Cluster) Metrics() Metrics {
 		HintsStored:    atomic.LoadUint64(&c.mHintsStored),
 		HintsReplayed:  atomic.LoadUint64(&c.mHintsReplayed),
 		Compacts:       atomic.LoadUint64(&c.mCompacts),
+		PrefixDeletes:  atomic.LoadUint64(&c.mPrefixDeletes),
+		LatencyGetMs:   getMs,
+		LatencyPutMs:   putMs,
 	}
 }
 
@@ -268,17 +308,43 @@ func (c *Cluster) markDown(addr string) {
 func (c *Cluster) markUp(addr string) {
 	c.hbMu.Lock()
 	st := c.hbStateLocked(addr)
+	if st.forced {
+		c.hbMu.Unlock()
+		return
+	}
 	st.down = false
 	st.lastOK = c.Now()
 	c.hbMu.Unlock()
 }
 
-// IsDown reports whether the last heartbeat/health probe marked addr unreachable.
+// ForceDown is operator fault injection. When down is true, writes skip addr
+// the same way they skip a heartbeat-down replica (store a hint instead of
+// waiting). Heartbeat and health probes must not mark the node up until
+// ForceDown(addr, false).
+func (c *Cluster) ForceDown(addr string, down bool) {
+	c.hbMu.Lock()
+	defer c.hbMu.Unlock()
+	st := c.hbStateLocked(addr)
+	st.forced = down
+	if down {
+		st.down = true
+	}
+}
+
+func (c *Cluster) isForced(addr string) bool {
+	c.hbMu.Lock()
+	defer c.hbMu.Unlock()
+	st, ok := c.hb[addr]
+	return ok && st.forced
+}
+
+// IsDown reports whether the last heartbeat/health probe marked addr unreachable
+// (including operator ForceDown).
 func (c *Cluster) IsDown(addr string) bool {
 	c.hbMu.Lock()
 	defer c.hbMu.Unlock()
 	st, ok := c.hb[addr]
-	return ok && st.down
+	return ok && (st.down || st.forced)
 }
 
 func (c *Cluster) lastOK(addr string) time.Time {
@@ -305,6 +371,9 @@ func (c *Cluster) Heartbeat() {
 			}
 			if err := n.Ping(); err != nil {
 				c.markDown(addr)
+				return
+			}
+			if c.isForced(addr) {
 				return
 			}
 			c.markUp(addr)
@@ -394,6 +463,8 @@ type ReadMeta struct {
 
 // Get performs a quorum read and returns the freshest value.
 func (c *Cluster) Get(key []byte) (value []byte, found bool, meta ReadMeta, err error) {
+	start := time.Now()
+	defer func() { c.observeGet(time.Since(start)) }()
 	atomic.AddUint64(&c.mGets, 1)
 	addrs, nodes := c.replicas(key)
 	reads := gatherReads(addrs, nodes, key)
@@ -517,6 +588,8 @@ func (c *Cluster) PutTTL(key, val []byte, ttl time.Duration) (WriteMeta, error) 
 }
 
 func (c *Cluster) putAt(key, val []byte, expiresAt uint64) (WriteMeta, error) {
+	start := time.Now()
+	defer func() { c.observePut(time.Since(start)) }()
 	atomic.AddUint64(&c.mPuts, 1)
 	addrs, nodes := c.replicas(key)
 	version := c.clock.tick(c.peekMaxVersion(addrs, nodes, key))
@@ -825,6 +898,7 @@ type NodeHealth struct {
 	Capacity     uint32     `json:"capacity,omitempty"`
 	Load         float64    `json:"load,omitempty"`
 	HintsPending int        `json:"hints_pending"`
+	Forced       bool       `json:"forced"`
 }
 
 // Health pings every node and pulls its stats. Also refreshes heartbeat state.
@@ -857,6 +931,7 @@ func (c *Cluster) Health() ([]NodeHealth, bool) {
 				tcopy := t
 				h.LastOK = &tcopy
 			}
+			h.Forced = c.isForced(a)
 			h.Down = c.IsDown(a)
 			out[i] = h
 		}(i, a)
@@ -923,4 +998,25 @@ func (c *Cluster) CompactAll() (int, []string) {
 	wg.Wait()
 	sort.Strings(errs)
 	return n, errs
+}
+
+// DeletePrefix scans live keys starting with prefix and deletes each with a
+// fresh version. Quorum is best-effort per key: failures are skipped and the
+// first error is returned alongside the number of successful deletes.
+func (c *Cluster) DeletePrefix(prefix string) (int, error) {
+	atomic.AddUint64(&c.mPrefixDeletes, 1)
+	rows, _ := c.ScanPrefix(prefix)
+	n := 0
+	var first error
+	for _, row := range rows {
+		_, _, err := c.Del([]byte(row.Key))
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		n++
+	}
+	return n, first
 }

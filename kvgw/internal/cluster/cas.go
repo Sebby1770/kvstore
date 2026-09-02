@@ -26,6 +26,8 @@ func (c *Cluster) CASTTL(key []byte, expectedVersion uint64, val []byte, ttl tim
 }
 
 func (c *Cluster) cas(key []byte, expectedVersion uint64, val []byte, expiresAt uint64) (WriteMeta, error) {
+	start := time.Now()
+	defer func() { c.observePut(time.Since(start)) }()
 	unlock := c.locks.lock(string(key))
 	defer unlock()
 

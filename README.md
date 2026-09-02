@@ -30,8 +30,9 @@ Go** — each language in the layer it actually fits.
   **expires_at**. Writes are **last-writer-wins** and idempotent, deletes are
   **versioned tombstones**, expired keys are lazily tombstoned, **rehash**
   drops tombstones (GC) and auto-grows past ~70% load, **compact** rehashes at
-  the same capacity (GC without grow), and the header carries a **CRC32** so a
-  torn page is caught on open.
+  the same capacity (GC without grow), **prefix scan** visits live keys by
+  `memcmp` on a key prefix, and the header carries a **CRC32** so a torn page
+  is caught on open.
 - **Rust** owns the node daemon — a TCP server speaking a length-prefixed binary
   protocol, calling into the C engine over FFI. It's deliberately dumb: it stores
   whatever version and expiry it's told and reports them back. All distributed
@@ -96,6 +97,8 @@ bin/kvstore --gw http://127.0.0.1:8090 scan hel        # prefix scan
 bin/kvstore --gw http://127.0.0.1:8090 health
 bin/kvstore --gw http://127.0.0.1:8090 compact         # GC tombstones on live nodes
 bin/kvstore --gw http://127.0.0.1:8090 watch hello     # poll get until Ctrl-C
+bin/kvstore --gw http://127.0.0.1:8090 rm-prefix hel   # delete keys starting with hel
+bin/kvstore --gw http://127.0.0.1:8090 fault 127.0.0.1:7071 on
 ```
 
 Or with `curl` (response headers are `X-KV-*`; `X-Triglot-*` is still accepted
@@ -106,6 +109,8 @@ curl -i -X PUT --data-binary 'world' http://127.0.0.1:8090/kv/hello
 curl -i http://127.0.0.1:8090/kv/hello
 curl    http://127.0.0.1:8090/scan
 curl    'http://127.0.0.1:8090/scan?prefix=hel'
+curl -X DELETE 'http://127.0.0.1:8090/scan?prefix=hel'
+curl -X POST 'http://127.0.0.1:8090/admin/fault?addr=127.0.0.1:7071&down=1'
 curl    http://127.0.0.1:8090/route/hello
 ```
 
@@ -155,7 +160,9 @@ answers again.
 
 `GET /health` includes `down` and `last_ok` per node, plus `hints_pending`
 (queued, not yet replayed), `capacity`, and `load` (`count/capacity`). Metrics
-expose `hints_stored` / `hints_replayed` / `compacts`.
+expose `hints_stored` / `hints_replayed` / `compacts` / `prefix_deletes`, plus
+EWMA `latency_get_ms` / `latency_put_ms`. Nodes include `forced` when an
+operator has injected a fault.
 
 ## Compact (tombstone GC)
 
@@ -169,6 +176,34 @@ curl -X POST http://127.0.0.1:8090/admin/compact
 ```
 
 The dashboard Compact button hits the same endpoint.
+
+## Prefix delete
+
+`DeletePrefix` scans live keys starting with a prefix and tombstones each with
+a new version (best-effort quorum). Empty prefix is a full scan, same as the
+engine.
+
+```sh
+bin/kvstore --gw http://127.0.0.1:8090 rm-prefix sess
+curl -X DELETE 'http://127.0.0.1:8090/scan?prefix=sess'
+```
+
+The dashboard **delete prefix** button (confirm) uses the current filter box.
+
+## Fault injection
+
+`ForceDown(addr, true)` marks a node down for writes without taking it off the
+ring — the same skip-and-hint path as a failed heartbeat. Heartbeat **must
+not** mark that node up until `ForceDown(addr, false)`.
+
+```sh
+bin/kvstore --gw http://127.0.0.1:8090 fault 127.0.0.1:7071 on
+curl -X POST 'http://127.0.0.1:8090/admin/fault?addr=127.0.0.1:7071&down=1'
+# …later
+bin/kvstore --gw http://127.0.0.1:8090 fault 127.0.0.1:7071 off
+```
+
+Each node card on the dashboard has a **fault** / **heal** toggle.
 
 ## CLI watch
 
@@ -279,12 +314,14 @@ asserts none are lost.
 
 The gateway serves a self-contained control room at `GET /dashboard` (no build
 step, no dependencies). Charcoal / phosphor / amber / steel. Click a key row to
-**inspect** it (value, version, replicas, expiry; loads put/get; get/del/route).
+**inspect** it (value, version, replicas, expiry; JSON values are pretty-printed;
+replica **route** list as pills from `/route/{key}`; loads put/get; get/del/route).
 An **ops log** keeps the last ~24 actions. Put accepts CAS (`If-Match`). The
-filter box calls `GET /scan?prefix=` when it looks like a prefix. Values toggle
-UTF-8 / hex. Each node shows heartbeat, keys, tombs, a capacity/load bar, and
-pending hints. Compact posts `/admin/compact`. A selected key is re-fetched each
-refresh and flashes if its version changed.
+filter box calls `GET /scan?prefix=` when it looks like a prefix, with a confirm
+**delete prefix**. Values toggle UTF-8 / hex. Each node shows heartbeat, keys,
+tombs, a capacity/load bar, pending hints, and a **fault** toggle. Compact posts
+`/admin/compact`. Metrics include get/put EWMA latency. A selected key is
+re-fetched each refresh and flashes if its version changed.
 
 ```sh
 open http://127.0.0.1:8090/dashboard
@@ -346,8 +383,9 @@ Magic `KVST0003`. Each slot is `{state, key, value, version, expires_at}`.
 `kv_put` is immortal (`expires_at = 0`); `kv_put_ttl` sets expiry.
 `kv_set_time` injects a clock for tests. `kv_rehash` copies live non-expired
 keys and **drops tombstones**. `kv_compact` rehashes at the current capacity
-(GC without grow). Inserts that would return `KV_FULL` double capacity and
-retry once.
+(GC without grow). `kv_scan_prefix` visits live keys whose bytes start with a
+prefix (`memcmp`; empty prefix = full scan). Inserts that would return
+`KV_FULL` double capacity and retry once.
 
 ## What it still is not
 
@@ -358,6 +396,18 @@ retry once.
   write-skipping and hint replay, but it does not auto-eject nodes. Join/leave
   goes through `/admin/nodes`.
 - Fixed-size slots and `MS_SYNC` per write are honest, not fast.
+
+## JS client
+
+`clients/kv.js` is a no-dependency `fetch` wrapper (`get` / `put` / `del` /
+`scan` / `health`). It exports `buildUrl` so URL/method helpers can be tested
+without a live cluster.
+
+```js
+const { createClient } = require('./clients/kv.js');
+const kv = createClient('http://127.0.0.1:8090');
+await kv.put('hello', 'world');
+```
 
 ## Layout
 
@@ -372,6 +422,7 @@ kvgw/
   internal/proto    wire codec
   cmd/gateway       HTTP front door + dashboard
   cmd/kvstore       CLI
+clients/            tiny JS HTTP client (no deps)
 docker-compose.yml  4 kvnodes + gateway on :8090
 scripts/            demo.sh
 ```

@@ -300,6 +300,18 @@ func TestDashboardKVStore(t *testing.T) {
 	if !strings.Contains(dashboardHTML, "/scan?prefix=") {
 		t.Fatal("dashboard missing prefix scan")
 	}
+	if !strings.Contains(dashboardHTML, "/admin/fault") {
+		t.Fatal("dashboard missing fault inject")
+	}
+	if !strings.Contains(dashboardHTML, "JSON.stringify") {
+		t.Fatal("dashboard missing JSON pretty-print")
+	}
+	if !strings.Contains(dashboardHTML, "latency_get_ms") || !strings.Contains(dashboardHTML, "latency_put_ms") {
+		t.Fatal("dashboard missing latency metrics")
+	}
+	if !strings.Contains(dashboardHTML, "/route/") {
+		t.Fatal("dashboard missing replica route pills")
+	}
 	srv, _ := testGateway()
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/dashboard")
@@ -419,6 +431,117 @@ func TestHTTPCompactAndHealthFields(t *testing.T) {
 		if n.Capacity == 0 {
 			t.Fatalf("capacity missing: %+v", n)
 		}
+	}
+}
+
+func TestHTTPPrefixDeleteFaultAndLatency(t *testing.T) {
+	srv, cl := testGateway()
+	defer srv.Close()
+
+	put := func(k, v string) {
+		t.Helper()
+		req, _ := http.NewRequest("PUT", srv.URL+"/kv/"+k, strings.NewReader(v))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("put %s: %v %v", k, err, resp)
+		}
+		resp.Body.Close()
+	}
+	put("a", "1")
+	put("aa", "2")
+	put("b", "3")
+
+	req, _ := http.NewRequest("DELETE", srv.URL+"/scan?prefix=a", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dr struct {
+		Deleted int `json:"deleted"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || dr.Deleted != 2 {
+		t.Fatalf("prefix delete status=%d deleted=%d", resp.StatusCode, dr.Deleted)
+	}
+
+	got, err := http.Get(srv.URL + "/kv/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(got.Body)
+	got.Body.Close()
+	if got.StatusCode != 200 || string(body) != "3" {
+		t.Fatalf("b after prefix delete: %d %q", got.StatusCode, body)
+	}
+	got, err = http.Get(srv.URL + "/kv/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.Body.Close()
+	if got.StatusCode != http.StatusNotFound {
+		t.Fatalf("a should be gone, status=%d", got.StatusCode)
+	}
+
+	req, _ = http.NewRequest("POST", srv.URL+"/admin/fault?addr=n0&down=1", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("fault on: %v %v", err, resp)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var health struct {
+		Metrics map[string]any   `json:"metrics"`
+		Nodes   []map[string]any `json:"nodes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if _, ok := health.Metrics["latency_get_ms"]; !ok {
+		t.Fatalf("missing latency_get_ms: %v", health.Metrics)
+	}
+	if _, ok := health.Metrics["latency_put_ms"]; !ok {
+		t.Fatalf("missing latency_put_ms: %v", health.Metrics)
+	}
+	if _, ok := health.Metrics["prefix_deletes"]; !ok {
+		t.Fatalf("missing prefix_deletes: %v", health.Metrics)
+	}
+	if pd, _ := health.Metrics["prefix_deletes"].(float64); pd < 1 {
+		t.Fatalf("prefix_deletes=%v", health.Metrics["prefix_deletes"])
+	}
+	var sawForced bool
+	for _, n := range health.Nodes {
+		if n["addr"] == "n0" {
+			if forced, _ := n["forced"].(bool); !forced {
+				t.Fatalf("n0 should be forced: %v", n)
+			}
+			sawForced = true
+		}
+		if _, ok := n["forced"]; !ok {
+			t.Fatalf("node missing forced: %v", n)
+		}
+	}
+	if !sawForced {
+		t.Fatal("missing n0 in health")
+	}
+
+	req, _ = http.NewRequest("POST", srv.URL+"/admin/fault?addr=n0&down=0", nil)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("fault off: %v %v", err, resp)
+	}
+	resp.Body.Close()
+
+	cl.Heartbeat()
+	if cl.IsDown("n0") {
+		t.Fatal("n0 should recover after ForceDown(false)+heartbeat")
 	}
 }
 

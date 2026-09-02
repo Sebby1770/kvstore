@@ -3,6 +3,50 @@
 All notable changes to KVStore are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.2.0] — 2026-09-02
+
+Prefix scan in the engine, prefix delete, operator fault injection, and
+per-op get/put latency.
+
+### Added
+
+**Engine (C)**
+
+- `kv_scan_prefix(db, prefix, plen, cb, ctx)` visits live keys whose key bytes
+  start with `prefix` (`memcmp`). Empty prefix (`plen == 0`) is a full scan.
+
+**Coordinator**
+
+- `DeletePrefix(prefix) (n int, err error)` — scan, then delete each matching
+  key with a new version (best-effort quorum). Metric `PrefixDeletes`.
+- EWMA milliseconds for Get and Put: `LatencyGetMs`, `LatencyPutMs` on
+  `Metrics` (`latency_get_ms`, `latency_put_ms` in JSON).
+- `ForceDown(addr, down)` — operator fault inject. `ForceDown(true)` skips
+  writes like heartbeat-down. Heartbeat must not mark a force-downed node up
+  until `ForceDown(false)`. `forced` flag on `hbState`.
+
+**HTTP / dashboard / CLI**
+
+- `DELETE /scan?prefix=`
+- `POST /admin/fault?addr=&down=1|0`
+- `/health` metrics include `latency_get_ms`, `latency_put_ms`, `prefix_deletes`
+- `/health` nodes include `forced` bool
+- Control room: replica-map pills on inspect (`GET /route/{key}`), fault-inject
+  toggle on each node card, prefix-delete (confirm) using the current filter,
+  get/put latency metrics, pretty-print JSON values in inspect.
+- CLI: `kvstore rm-prefix PREFIX` and `kvstore fault ADDR on|off`.
+
+**JS client**
+
+- `clients/kv.js` — no-deps fetch wrapper: `get` / `put` / `del` / `scan` /
+  `health`. Exports `buildUrl`.
+
+### Tests
+
+- Engine: put `a`/`aa`/`b`, prefix `"a"` sees `a` and `aa` only.
+- Coordinator: `ForceDown` is not healed by heartbeat; `DeletePrefix`.
+- HTTP: prefix delete, fault inject, health JSON fields.
+
 ## [1.1.0] — 2026-09-02
 
 Tombstone GC without grow, an operator-facing control room, and CLI watch.

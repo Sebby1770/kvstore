@@ -33,6 +33,28 @@ static int all_cb(const void *k, uint32_t klen,
     return 0;
 }
 
+typedef struct { char keys[8][KV_KEY_MAX + 1]; int n; } prefix_ctx;
+
+static int prefix_collect_cb(const void *k, uint32_t klen,
+                             const void *v, uint32_t vlen,
+                             uint64_t version, uint64_t expires_at, void *ctx) {
+    (void)v; (void)vlen; (void)version; (void)expires_at;
+    prefix_ctx *c = (prefix_ctx *)ctx;
+    if (c->n >= 8) return 0;
+    uint32_t n = klen < KV_KEY_MAX ? klen : KV_KEY_MAX;
+    memcpy(c->keys[c->n], k, n);
+    c->keys[c->n][n] = 0;
+    c->n++;
+    return 0;
+}
+
+static int has_key(const prefix_ctx *c, const char *k) {
+    for (int i = 0; i < c->n; i++) {
+        if (strcmp(c->keys[i], k) == 0) return 1;
+    }
+    return 0;
+}
+
 static void expect_val(kv_db *db, const char *key, const char *want, uint64_t want_ver) {
     char buf[KV_VALUE_MAX];
     uint32_t n = 0;
@@ -217,6 +239,31 @@ int main(void) {
     kv_close(db);
 
     assert(kv_compact(NULL) == KV_ERROR);
+
+    // --- Prefix scan: live keys whose bytes start with prefix (memcmp). ---
+    unlink(path);
+    db = NULL;
+    assert(kv_open(path, 32, &db) == KV_OK);
+    assert(kv_put(db, "a",  1, "1", 1, 1) == KV_OK);
+    assert(kv_put(db, "aa", 2, "2", 1, 1) == KV_OK);
+    assert(kv_put(db, "b",  1, "3", 1, 1) == KV_OK);
+
+    prefix_ctx pc = {0};
+    assert(kv_scan_prefix(db, "a", 1, prefix_collect_cb, &pc) == KV_OK);
+    assert(pc.n == 2);
+    assert(has_key(&pc, "a") && has_key(&pc, "aa") && !has_key(&pc, "b"));
+
+    prefix_ctx empty = {0};
+    assert(kv_scan_prefix(db, NULL, 0, prefix_collect_cb, &empty) == KV_OK);
+    assert(empty.n == 3);
+    assert(has_key(&empty, "a") && has_key(&empty, "aa") && has_key(&empty, "b"));
+
+    prefix_ctx none = {0};
+    assert(kv_scan_prefix(db, "z", 1, prefix_collect_cb, &none) == KV_OK);
+    assert(none.n == 0);
+
+    assert(kv_scan_prefix(NULL, "a", 1, prefix_collect_cb, &pc) == KV_ERROR);
+    kv_close(db);
 
     // --- CRC / magic: a torn or forged header is KV_BAD_FILE. ---
     unlink(path);

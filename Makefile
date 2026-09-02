@@ -34,6 +34,7 @@ test: engine-test
 	cd kvnode && cargo test
 	cd kvgw && go test ./...
 	cd kvgw && go vet ./...
+	node clients/kv_test.js
 
 demo: all
 	./scripts/demo.sh

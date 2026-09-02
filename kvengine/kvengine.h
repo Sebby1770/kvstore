@@ -74,6 +74,11 @@ typedef int (*kv_scan_cb)(const void *key, uint32_t key_len,
  * slots are lazily tombstoned and skipped. */
 int      kv_scan(kv_db *db, kv_scan_cb cb, void *ctx);
 
+/* Like kv_scan, but only live keys whose first `plen` bytes match `prefix`
+ * (memcmp). plen == 0 (or an empty prefix) is a full scan. */
+int      kv_scan_prefix(kv_db *db, const void *prefix, uint32_t plen,
+                        kv_scan_cb cb, void *ctx);
+
 typedef int (*kv_scan_all_cb)(const void *key, uint32_t key_len,
                               const void *value, uint32_t value_len,
                               uint64_t version, uint64_t expires_at,

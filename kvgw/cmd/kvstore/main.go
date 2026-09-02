@@ -13,6 +13,8 @@
 //	kvstore import          (JSON on stdin)
 //	kvstore compact
 //	kvstore watch   KEY
+//	kvstore rm-prefix PREFIX
+//	kvstore fault   ADDR on|off
 //	kvstore bench   [N]
 package main
 
@@ -46,8 +48,9 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "kvstore [--gw URL] [--timeout D] <cmd> [args...]\n")
 		fmt.Fprintf(os.Stderr, "  get KEY | put KEY VALUE [--ttl 10s] | cas KEY VER VALUE | del KEY\n")
-		fmt.Fprintf(os.Stderr, "  expire KEY DURATION | scan [prefix] | route KEY | health | metrics\n")
-		fmt.Fprintf(os.Stderr, "  export | import | compact | watch KEY | bench [N]\n")
+		fmt.Fprintf(os.Stderr, "  expire KEY DURATION | scan [prefix] | rm-prefix PREFIX | route KEY\n")
+		fmt.Fprintf(os.Stderr, "  health | metrics | export | import | compact | watch KEY\n")
+		fmt.Fprintf(os.Stderr, "  fault ADDR on|off | bench [N]\n")
 	}
 	flag.Parse()
 
@@ -305,6 +308,49 @@ func main() {
 			fmt.Println(pretty.String())
 		} else {
 			os.Stdout.Write(body)
+		}
+
+	case "rm-prefix":
+		if len(args) != 1 {
+			fail("rm-prefix PREFIX")
+		}
+		body, _, status, err := do(c, "DELETE", *gw+"/scan?prefix="+url.QueryEscape(args[0]), nil, nil)
+		check(err)
+		var pretty bytes.Buffer
+		if json.Indent(&pretty, body, "", "  ") == nil {
+			fmt.Println(pretty.String())
+		} else {
+			os.Stdout.Write(body)
+			if !bytes.HasSuffix(body, []byte{'\n'}) {
+				fmt.Println()
+			}
+		}
+		if status != http.StatusOK {
+			os.Exit(1)
+		}
+
+	case "fault":
+		if len(args) != 2 || (args[1] != "on" && args[1] != "off") {
+			fail("fault ADDR on|off")
+		}
+		down := "1"
+		if args[1] == "off" {
+			down = "0"
+		}
+		u := *gw + "/admin/fault?addr=" + url.QueryEscape(args[0]) + "&down=" + down
+		body, _, status, err := do(c, "POST", u, nil, nil)
+		check(err)
+		var pretty bytes.Buffer
+		if json.Indent(&pretty, body, "", "  ") == nil {
+			fmt.Println(pretty.String())
+		} else {
+			os.Stdout.Write(body)
+			if !bytes.HasSuffix(body, []byte{'\n'}) {
+				fmt.Println()
+			}
+		}
+		if status != http.StatusOK {
+			os.Exit(1)
 		}
 
 	case "compact":

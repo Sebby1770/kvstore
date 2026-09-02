@@ -73,6 +73,36 @@ func (g *gateway) handleCompact(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"compacted": n, "errors": errs})
 }
 
+func (g *gateway) handleDeletePrefix(w http.ResponseWriter, r *http.Request) {
+	n, err := g.cluster.DeletePrefix(r.URL.Query().Get("prefix"))
+	out := map[string]any{"deleted": n}
+	if err != nil {
+		out["error"] = err.Error()
+	}
+	writeJSON(w, out)
+}
+
+func (g *gateway) handleFault(w http.ResponseWriter, r *http.Request) {
+	addr := strings.TrimSpace(r.URL.Query().Get("addr"))
+	if addr == "" {
+		http.Error(w, "addr query parameter required", http.StatusBadRequest)
+		return
+	}
+	raw := strings.TrimSpace(r.URL.Query().Get("down"))
+	var down bool
+	switch raw {
+	case "1", "true", "on":
+		down = true
+	case "0", "false", "off":
+		down = false
+	default:
+		http.Error(w, "down must be 1 or 0", http.StatusBadRequest)
+		return
+	}
+	g.cluster.ForceDown(addr, down)
+	writeJSON(w, map[string]any{"addr": addr, "down": down, "forced": down})
+}
+
 func (g *gateway) handleRemoveNode(w http.ResponseWriter, r *http.Request) {
 	addr := r.PathValue("addr")
 	if !g.cluster.RemoveNode(addr) {
@@ -355,6 +385,7 @@ func (g *gateway) routes() http.Handler {
 	mux.HandleFunc("PUT /kv/{key}", g.handlePut)
 	mux.HandleFunc("DELETE /kv/{key}", g.handleDel)
 	mux.HandleFunc("GET /scan", g.handleScan)
+	mux.HandleFunc("DELETE /scan", g.handleDeletePrefix)
 	mux.HandleFunc("GET /export", g.handleExport)
 	mux.HandleFunc("POST /import", g.handleImport)
 	mux.HandleFunc("GET /route/{key}", g.handleRoute)
@@ -368,6 +399,7 @@ func (g *gateway) routes() http.Handler {
 	mux.HandleFunc("POST /admin/nodes", g.handleAddNode)
 	mux.HandleFunc("DELETE /admin/nodes/{addr}", g.handleRemoveNode)
 	mux.HandleFunc("POST /admin/compact", g.handleCompact)
+	mux.HandleFunc("POST /admin/fault", g.handleFault)
 	mux.HandleFunc("GET /dashboard", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(dashboardHTML))
@@ -377,13 +409,14 @@ func (g *gateway) routes() http.Handler {
 		fmt.Fprintf(w, "nodes: %s\n", strings.Join(g.cluster.Addrs(), ", "))
 		fmt.Fprintf(w, "RF=%d R=%d W=%d  (R+W>RF: %v)\n", g.cluster.RF(), g.cluster.R(), g.cluster.W(), g.cluster.Consistent())
 		fmt.Fprintf(w, "live dashboard: GET /dashboard   metrics: GET /metrics\n")
-		fmt.Fprintf(w, "endpoints: GET|PUT|DELETE /kv/{key}, GET /scan?prefix=, GET /route/{key}, GET /health\n")
+		fmt.Fprintf(w, "endpoints: GET|PUT|DELETE /kv/{key}, GET|DELETE /scan?prefix=, GET /route/{key}, GET /health\n")
 		fmt.Fprintf(w, "cas: PUT /kv/{key} with If-Match or X-KV-CAS: <version>  (409 on conflict)\n")
 		fmt.Fprintf(w, "ttl: PUT /kv/{key} with X-KV-TTL: <seconds>  (native engine expires_at)\n")
 		fmt.Fprintf(w, "snapshot: GET /export, POST /import\n")
 		fmt.Fprintf(w, "crdt: GET|POST /crdt/counter/{key}?delta=N, GET|POST /crdt/set/{key}?add=x&remove=y\n")
 		fmt.Fprintf(w, "admin: GET /admin/nodes, POST /admin/nodes?addr=host:port, DELETE /admin/nodes/{addr}\n")
 		fmt.Fprintf(w, "compact: POST /admin/compact  (GC tombstones on every live node)\n")
+		fmt.Fprintf(w, "prefix delete: DELETE /scan?prefix=  fault inject: POST /admin/fault?addr=&down=1|0\n")
 	})
 	return mux
 }
@@ -423,12 +456,15 @@ func (g *gateway) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"kvstore_hints_stored_total", "hinted-handoff records stored", m.HintsStored},
 		{"kvstore_hints_replayed_total", "hinted-handoff records replayed", m.HintsReplayed},
 		{"kvstore_compacts_total", "cluster compact (tombstone GC) operations", m.Compacts},
+		{"kvstore_prefix_deletes_total", "prefix-delete operations", m.PrefixDeletes},
 	}
 	for _, c := range counters {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", c.name, c.help, c.name, c.name, c.val)
 	}
 	fmt.Fprintf(w, "# TYPE kvstore_nodes gauge\nkvstore_nodes %d\n", len(g.cluster.Addrs()))
 	fmt.Fprintf(w, "# TYPE kvstore_rf gauge\nkvstore_rf %d\n", g.cluster.RF())
+	fmt.Fprintf(w, "# TYPE kvstore_latency_get_ms gauge\nkvstore_latency_get_ms %g\n", m.LatencyGetMs)
+	fmt.Fprintf(w, "# TYPE kvstore_latency_put_ms gauge\nkvstore_latency_put_ms %g\n", m.LatencyPutMs)
 }
 
 func main() {
