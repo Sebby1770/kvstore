@@ -41,6 +41,7 @@ extern "C" {
     fn kv_del(db: *mut kv_db, key: *const u8, key_len: u32, version: u64) -> c_int;
     fn kv_scan(db: *mut kv_db, cb: ScanCb, ctx: *mut c_void) -> c_int;
     fn kv_scan_all(db: *mut kv_db, cb: ScanAllCb, ctx: *mut c_void) -> c_int;
+    fn kv_compact(db: *mut kv_db) -> c_int;
     fn kv_count(db: *const kv_db) -> u32;
     fn kv_capacity(db: *const kv_db) -> u32;
     fn kv_tombstones(db: *const kv_db) -> u32;
@@ -196,6 +197,10 @@ impl Db {
         let ctx = &mut out as *mut _ as *mut c_void;
         unsafe { kv_scan_all(self.raw, cb, ctx); }
         out
+    }
+
+    pub fn compact(&mut self) -> Result<(), DbErr> {
+        check(unsafe { kv_compact(self.raw) })
     }
 
     pub fn count(&self) -> u32        { unsafe { kv_count(self.raw) } }

@@ -141,6 +141,20 @@ func (f *fakeNode) ScanAll() ([]kv.Entry, error) {
 	return f.scanLocked(true)
 }
 
+func (f *fakeNode) Compact() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.down {
+		return errDown
+	}
+	for k, r := range f.data {
+		if r.State == kv.Deleted {
+			delete(f.data, k)
+		}
+	}
+	return nil
+}
+
 func (f *fakeNode) version(key string) uint64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()

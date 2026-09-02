@@ -117,6 +117,17 @@ func (m *memNode) ScanAll() ([]kv.Entry, error) {
 	return out, nil
 }
 
+func (m *memNode) Compact() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k, r := range m.data {
+		if r.State == kv.Deleted {
+			delete(m.data, k)
+		}
+	}
+	return nil
+}
+
 func testGateway() (*httptest.Server, *cluster.Cluster) {
 	addrs := []string{"n0", "n1", "n2"}
 	nodes := map[string]kv.Node{}
@@ -277,6 +288,18 @@ func TestDashboardKVStore(t *testing.T) {
 	if !strings.Contains(dashboardHTML, "#0b0d10") || !strings.Contains(dashboardHTML, "#9ae6b4") {
 		t.Fatal("dashboard missing control-room palette")
 	}
+	if !strings.Contains(dashboardHTML, "/admin/compact") {
+		t.Fatal("dashboard missing compact")
+	}
+	if !strings.Contains(dashboardHTML, "If-Match") {
+		t.Fatal("dashboard missing CAS If-Match")
+	}
+	if !strings.Contains(dashboardHTML, "inspect") || !strings.Contains(dashboardHTML, "oplog") {
+		t.Fatal("dashboard missing inspect/ops log")
+	}
+	if !strings.Contains(dashboardHTML, "/scan?prefix=") {
+		t.Fatal("dashboard missing prefix scan")
+	}
 	srv, _ := testGateway()
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/dashboard")
@@ -287,6 +310,115 @@ func TestDashboardKVStore(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 200 || !bytes.Contains(body, []byte("KVStore")) {
 		t.Fatalf("GET /dashboard = %d", resp.StatusCode)
+	}
+}
+
+func TestHTTPCompactAndHealthFields(t *testing.T) {
+	srv, _ := testGateway()
+	defer srv.Close()
+
+	put := func(k, v string) {
+		t.Helper()
+		req, _ := http.NewRequest("PUT", srv.URL+"/kv/"+k, strings.NewReader(v))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("put %s: %v %v", k, err, resp)
+		}
+		resp.Body.Close()
+	}
+	put("keep", "v")
+	put("gone", "x")
+	req, _ := http.NewRequest("DELETE", srv.URL+"/kv/gone", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("del: %v %v", err, resp)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before struct {
+		Nodes []map[string]any `json:"nodes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&before); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(before.Nodes) == 0 {
+		t.Fatal("no nodes in health")
+	}
+	if _, ok := before.Nodes[0]["hints_pending"]; !ok {
+		t.Fatalf("missing hints_pending: %v", before.Nodes[0])
+	}
+	if _, ok := before.Nodes[0]["capacity"]; !ok {
+		t.Fatalf("missing capacity: %v", before.Nodes[0])
+	}
+	if _, ok := before.Nodes[0]["load"]; !ok {
+		t.Fatalf("missing load: %v", before.Nodes[0])
+	}
+
+	resp, err = http.Post(srv.URL+"/admin/compact", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("compact status %d %s", resp.StatusCode, body)
+	}
+	var cr struct {
+		Compacted int      `json:"compacted"`
+		Errors    []string `json:"errors"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if cr.Compacted != 3 {
+		t.Fatalf("compacted=%d errors=%v", cr.Compacted, cr.Errors)
+	}
+
+	got, err := http.Get(srv.URL + "/kv/keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(got.Body)
+	got.Body.Close()
+	if got.StatusCode != 200 || string(body) != "v" {
+		t.Fatalf("keep after compact: %d %q", got.StatusCode, body)
+	}
+
+	resp, err = http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after struct {
+		Metrics struct {
+			Compacts uint64 `json:"compacts"`
+		} `json:"metrics"`
+		Nodes []struct {
+			Tombstones   uint32  `json:"tombstones"`
+			Capacity     uint32  `json:"capacity"`
+			Load         float64 `json:"load"`
+			HintsPending int     `json:"hints_pending"`
+			Count        uint32  `json:"count"`
+		} `json:"nodes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&after); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if after.Metrics.Compacts < 1 {
+		t.Fatalf("compacts metric: %+v", after.Metrics)
+	}
+	for _, n := range after.Nodes {
+		if n.Tombstones != 0 {
+			t.Fatalf("tombstones after compact: %+v", n)
+		}
+		if n.Capacity == 0 {
+			t.Fatalf("capacity missing: %+v", n)
+		}
 	}
 }
 

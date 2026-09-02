@@ -29,8 +29,9 @@ Go** — each language in the layer it actually fits.
   (FNV-1a + linear probing). Every slot carries a **version** and optional
   **expires_at**. Writes are **last-writer-wins** and idempotent, deletes are
   **versioned tombstones**, expired keys are lazily tombstoned, **rehash**
-  drops tombstones (GC) and auto-grows past ~70% load, and the header carries
-  a **CRC32** so a torn page is caught on open.
+  drops tombstones (GC) and auto-grows past ~70% load, **compact** rehashes at
+  the same capacity (GC without grow), and the header carries a **CRC32** so a
+  torn page is caught on open.
 - **Rust** owns the node daemon — a TCP server speaking a length-prefixed binary
   protocol, calling into the C engine over FFI. It's deliberately dumb: it stores
   whatever version and expiry it's told and reports them back. All distributed
@@ -93,6 +94,8 @@ bin/kvstore --gw http://127.0.0.1:8090 route hello     # -> the 3 replicas
 bin/kvstore --gw http://127.0.0.1:8090 scan
 bin/kvstore --gw http://127.0.0.1:8090 scan hel        # prefix scan
 bin/kvstore --gw http://127.0.0.1:8090 health
+bin/kvstore --gw http://127.0.0.1:8090 compact         # GC tombstones on live nodes
+bin/kvstore --gw http://127.0.0.1:8090 watch hello     # poll get until Ctrl-C
 ```
 
 Or with `curl` (response headers are `X-KV-*`; `X-Triglot-*` is still accepted
@@ -150,8 +153,32 @@ node, tracks `down` / `last_ok` **without removing anyone from the ring**
 instead of waiting out the full timeout, and **replays hints** when the node
 answers again.
 
-`GET /health` includes `down` and `last_ok` per node. Metrics expose
-`hints_stored` / `hints_replayed`.
+`GET /health` includes `down` and `last_ok` per node, plus `hints_pending`
+(queued, not yet replayed), `capacity`, and `load` (`count/capacity`). Metrics
+expose `hints_stored` / `hints_replayed` / `compacts`.
+
+## Compact (tombstone GC)
+
+Deletes leave versioned tombstones. `kv_compact` rehashes a node at the same
+capacity so tombstones and expired keys are dropped without growing the table.
+The coordinator's `CompactAll` is best-effort across every live node.
+
+```sh
+bin/kvstore --gw http://127.0.0.1:8090 compact
+curl -X POST http://127.0.0.1:8090/admin/compact
+```
+
+The dashboard Compact button hits the same endpoint.
+
+## CLI watch
+
+`kvstore watch KEY` polls `GET /kv/{key}` every second until Ctrl-C and prints
+the version and value (or `(missing)`).
+
+```sh
+bin/kvstore --gw http://127.0.0.1:8090 watch hello
+# v1 world
+```
 
 ## Export / import
 
@@ -251,9 +278,13 @@ asserts none are lost.
 ## Live dashboard
 
 The gateway serves a self-contained control room at `GET /dashboard` (no build
-step, no dependencies). Charcoal / phosphor / amber / steel — live nodes with
-heartbeat state, metrics including hints, a key browser, put/get/del with TTL,
-add/remove node, CRDT counter/set widgets, and a sparkline of ops.
+step, no dependencies). Charcoal / phosphor / amber / steel. Click a key row to
+**inspect** it (value, version, replicas, expiry; loads put/get; get/del/route).
+An **ops log** keeps the last ~24 actions. Put accepts CAS (`If-Match`). The
+filter box calls `GET /scan?prefix=` when it looks like a prefix. Values toggle
+UTF-8 / hex. Each node shows heartbeat, keys, tombs, a capacity/load bar, and
+pending hints. Compact posts `/admin/compact`. A selected key is re-fetched each
+refresh and flashes if its version changed.
 
 ```sh
 open http://127.0.0.1:8090/dashboard
@@ -296,6 +327,7 @@ Request   GET      : 1B op  4B klen  key
           SCAN_ALL : 1B op   (includes tombstones)
           PING     : 1B op
           STAT     : 1B op
+          COMPACT  : 1B op   (GC at current capacity; no payload)
 Response  1B status (0=ok 1=not_found 2=error 3=deleted)
 GET ok       + 8B version  8B expires  4B vlen  val
 GET deleted  + 8B version  8B expires
@@ -304,7 +336,7 @@ SCAN_ALL ok  + repeat(4B klen key 8B version 8B expires 1B tomb 4B vlen val), te
 STAT ok      + 4B count  4B capacity  8B max_version  4B tombstones
 ```
 
-Ops: `1=GET 2=PUT 3=DEL 4=SCAN 5=PING 6=STAT 7=PUTX 8=SCAN_ALL`. See
+Ops: `1=GET 2=PUT 3=DEL 4=SCAN 5=PING 6=STAT 7=PUTX 8=SCAN_ALL 9=COMPACT`. See
 [`kvnode/src/proto.rs`](kvnode/src/proto.rs) and
 [`kvgw/internal/proto/proto.go`](kvgw/internal/proto/proto.go).
 
@@ -313,8 +345,9 @@ Ops: `1=GET 2=PUT 3=DEL 4=SCAN 5=PING 6=STAT 7=PUTX 8=SCAN_ALL`. See
 Magic `KVST0003`. Each slot is `{state, key, value, version, expires_at}`.
 `kv_put` is immortal (`expires_at = 0`); `kv_put_ttl` sets expiry.
 `kv_set_time` injects a clock for tests. `kv_rehash` copies live non-expired
-keys and **drops tombstones**. Inserts that would return `KV_FULL` double
-capacity and retry once.
+keys and **drops tombstones**. `kv_compact` rehashes at the current capacity
+(GC without grow). Inserts that would return `KV_FULL` double capacity and
+retry once.
 
 ## What it still is not
 

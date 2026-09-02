@@ -24,7 +24,7 @@ const dashboardHTML = `<!doctype html>
       linear-gradient(90deg, rgba(139,155,180,.045) 1px, transparent 1px);
     background-size:28px 28px;
   }
-  .wrap{max-width:1080px;margin:0 auto;padding:28px 20px 64px}
+  .wrap{max-width:1180px;margin:0 auto;padding:28px 20px 64px}
   header.brand{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;margin-bottom:8px}
   h1{margin:0;font-size:22px;letter-spacing:.18em;text-transform:uppercase;color:var(--phosphor);
     text-shadow:0 0 18px rgba(154,230,180,.25);font-weight:650}
@@ -34,7 +34,7 @@ const dashboardHTML = `<!doctype html>
   .pill.ok{color:var(--phosphor);border-color:rgba(154,230,180,.35);background:rgba(154,230,180,.08)}
   .pill.bad{color:var(--bad);border-color:rgba(224,122,122,.4);background:rgba(224,122,122,.08)}
   h2{font-size:11px;color:var(--steel);font-weight:600;margin:0 0 10px;text-transform:uppercase;letter-spacing:1.4px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-bottom:18px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-bottom:18px}
   .node{border:1px solid var(--line);border-radius:4px;padding:12px;background:var(--panel);position:relative}
   .node.down{opacity:.55}
   .node::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--phosphor)}
@@ -43,6 +43,9 @@ const dashboardHTML = `<!doctype html>
   .dot{width:8px;height:8px;border-radius:50%;background:var(--phosphor);box-shadow:0 0 8px var(--phosphor)}
   .node.down .dot{background:var(--amber);box-shadow:0 0 8px var(--amber)}
   .nm{margin-top:6px;font-size:12px;color:var(--steel);font-variant-numeric:tabular-nums;line-height:1.45}
+  .bar{height:7px;background:#0b0d10;border:1px solid var(--line);border-radius:2px;margin-top:8px;overflow:hidden}
+  .bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--phosphor),var(--amber));width:0}
+  .hint{color:var(--amber)}
   .panel{border:1px solid var(--line);border-radius:4px;padding:14px;background:var(--panel);margin-bottom:16px}
   .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
   input,select{background:#0b0d10;color:var(--ink);border:1px solid var(--line);border-radius:3px;
@@ -53,10 +56,14 @@ const dashboardHTML = `<!doctype html>
   button:hover{background:rgba(154,230,180,.1)}
   button.ghost{color:var(--steel);border-color:var(--line)}
   button.amber{color:var(--amber);border-color:rgba(230,179,90,.45)}
+  button.on{background:rgba(154,230,180,.12);border-color:var(--phosphor)}
   #msg{margin-top:10px;font-size:13px;color:var(--steel);font-variant-numeric:tabular-nums;min-height:18px}
   table{width:100%;border-collapse:collapse;font-size:13px}
   th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
   th{color:var(--steel);font-weight:500;letter-spacing:.04em;text-transform:uppercase;font-size:11px}
+  tbody tr{cursor:pointer}
+  tbody tr:hover{background:rgba(154,230,180,.05)}
+  tbody tr.sel{background:rgba(154,230,180,.1);outline:1px solid rgba(154,230,180,.28)}
   .muted{color:var(--dim)}
   .metrics{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:8px;margin-bottom:10px}
   .metric{border:1px solid var(--line);border-radius:4px;padding:8px 10px;background:var(--panel)}
@@ -64,10 +71,28 @@ const dashboardHTML = `<!doctype html>
   .metric .v{font-size:18px;font-weight:600;color:var(--phosphor);font-variant-numeric:tabular-nums;margin-top:2px}
   .sparkwrap{display:flex;align-items:center;gap:10px;margin-bottom:18px;color:var(--steel);font-size:12px}
   #spark{display:block;background:#0b0d10;border:1px solid var(--line);border-radius:3px}
-  input#ttl,input#naddr{width:130px}
-  input#filter{min-width:180px}
-  .split{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-  @media(max-width:800px){.split{grid-template-columns:1fr}}
+  input#ttl,input#naddr,input#cas{width:140px}
+  input#filter{min-width:180px;flex:1}
+  .split{display:grid;grid-template-columns:1.4fr .9fr;gap:16px}
+  .inspect dl{margin:0;display:grid;grid-template-columns:88px 1fr;gap:6px 10px;font-size:13px}
+  .inspect dt{color:var(--steel);text-transform:uppercase;font-size:10px;letter-spacing:.08em;padding-top:4px}
+  .inspect dd{margin:0;word-break:break-all;font-variant-numeric:tabular-nums}
+  #inspect.flash{animation:flash .85s ease}
+  @keyframes flash{from{box-shadow:inset 0 0 0 1px var(--amber);background:rgba(230,179,90,.16)}to{box-shadow:none}}
+  #oplog{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;
+    background:#0b0d10;border:1px solid var(--line);border-radius:3px;padding:8px 10px;
+    max-height:210px;overflow:auto;line-height:1.55;color:var(--steel);white-space:pre}
+  #oplog .ok{color:var(--phosphor)}
+  #oplog .bad{color:var(--bad)}
+  #oplog .warn{color:var(--amber)}
+  .valhex{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+  @media(max-width:800px){
+    .split{grid-template-columns:1fr}
+    .row{flex-direction:column;align-items:stretch}
+    input,button,select{width:100%;min-height:44px;font-size:16px}
+    button{padding:12px 16px}
+    .wrap{padding:16px 12px 48px}
+  }
 </style>
 </head>
 <body>
@@ -98,6 +123,7 @@ const dashboardHTML = `<!doctype html>
       <input id="k" placeholder="key" value="hello" size="14" />
       <input id="v" placeholder="value" value="world" size="16" />
       <input id="ttl" placeholder="ttl seconds" type="number" min="0" />
+      <input id="cas" placeholder="If-Match version" />
       <button id="put">put</button>
       <button id="get" class="ghost">get</button>
       <button id="del" class="ghost">delete</button>
@@ -107,11 +133,17 @@ const dashboardHTML = `<!doctype html>
       <input id="naddr" placeholder="host:port" />
       <button id="addn" class="ghost">add node</button>
       <button id="rmn" class="amber">remove node</button>
+      <button id="compact" class="amber">compact</button>
       <button id="export" class="ghost">export JSON</button>
       <button id="importBtn" class="ghost">import JSON</button>
       <input id="importFile" type="file" accept="application/json,.json" hidden />
     </div>
     <div id="msg"></div>
+  </div>
+
+  <div class="panel">
+    <h2>ops log</h2>
+    <div id="oplog" class="muted">waiting for actions…</div>
   </div>
 
   <div class="split">
@@ -138,13 +170,25 @@ const dashboardHTML = `<!doctype html>
     </div>
   </div>
 
-  <div class="panel">
-    <h2>key browser</h2>
-    <div class="row" style="margin-bottom:10px">
-      <input id="filter" placeholder="search / filter keys…" />
+  <div class="split">
+    <div class="panel">
+      <h2>key browser</h2>
+      <div class="row" style="margin-bottom:10px">
+        <input id="filter" placeholder="prefix filter (GET /scan?prefix=)" />
+        <button id="hexbtn" class="ghost">values: utf-8</button>
+      </div>
+      <table><thead><tr><th>key</th><th>value</th><th>version</th><th>replicas</th><th>expires</th></tr></thead>
+      <tbody id="keys"></tbody></table>
     </div>
-    <table><thead><tr><th>key</th><th>value</th><th>version</th><th>replicas</th><th>expires</th></tr></thead>
-    <tbody id="keys"></tbody></table>
+    <div class="panel inspect" id="inspect">
+      <h2>inspect</h2>
+      <div id="inspectBody" class="muted">click a key row</div>
+      <div class="row" style="margin-top:12px">
+        <button id="iget" class="ghost">get</button>
+        <button id="idel" class="ghost">delete</button>
+        <button id="iroute" class="ghost">route</button>
+      </div>
+    </div>
   </div>
 </div>
 <script>
@@ -153,9 +197,42 @@ const dashboardHTML = `<!doctype html>
   function esc(t){var d=document.createElement('div');d.textContent=(t==null?'':String(t));return d.innerHTML;}
   function jget(u){return fetch(u).then(function(r){return r.json();});}
   function msg(t){el('msg').textContent=t;}
+  function hdr(r,n){return r.headers.get('X-KV-'+n)||r.headers.get('X-Triglot-'+n)||'';}
+  function clock(){
+    var d=new Date();
+    function p(n){return (n<10?'0':'')+n;}
+    return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+  }
   var hist=[];
   var lastTotal=null;
   var allRows=[];
+  var hexMode=false;
+  var selected=null;
+  var watchVer=null;
+  var ops=[];
+  var filterTimer=null;
+
+  function looksLikePrefix(q){
+    q=(q||'').trim();
+    if(!q) return false;
+    if(/\s/.test(q)) return false;
+    return true;
+  }
+  function scanURL(){
+    var q=(el('filter').value||'').trim();
+    if(q.slice(-1)==='*') q=q.slice(0,-1);
+    if(looksLikePrefix(q)) return '/scan?prefix='+encodeURIComponent(q);
+    return '/scan';
+  }
+  function toHex(s){
+    try{
+      var bytes=new TextEncoder().encode(String(s==null?'':s));
+      var hex='';
+      for(var i=0;i<bytes.length;i++) hex+=('0'+bytes[i].toString(16)).slice(-2);
+      return hex||'—';
+    }catch(e){return String(s);}
+  }
+  function showVal(v){ return hexMode ? toHex(v) : String(v==null?'':v); }
   function expLabel(e){
     if(!e || !e.expires_at){return '—';}
     var sec=e.expires_at-Math.floor(Date.now()/1000);
@@ -163,6 +240,16 @@ const dashboardHTML = `<!doctype html>
     if(sec<60){return sec+'s';}
     if(sec<3600){return Math.floor(sec/60)+'m '+ (sec%60)+'s';}
     return Math.floor(sec/3600)+'h';
+  }
+  function logOp(kind, status, detail){
+    var cls='ok';
+    if(status>=400) cls='bad';
+    else if(status>=300) cls='warn';
+    ops.unshift({t:clock(), kind:kind, status:status, detail:detail||'', cls:cls});
+    if(ops.length>24) ops.pop();
+    el('oplog').innerHTML=ops.map(function(o){
+      return '<span class="'+o.cls+'">'+esc(o.t)+'  '+esc(o.kind.toUpperCase())+'  '+esc(o.status)+'  '+esc(o.detail)+'</span>';
+    }).join('\n') || '<span class="muted">waiting for actions…</span>';
   }
   function drawSpark(){
     var svg=el('spark'), w=240, h=36;
@@ -182,13 +269,104 @@ const dashboardHTML = `<!doctype html>
     svg.innerHTML='<polyline fill="none" stroke="#9ae6b4" stroke-width="1.6" points="'+pts.join(' ')+'"/>';
     el('sparkcap').textContent=last+' ops / 1.5s  (last '+hist.length+' samples)';
   }
+  function renderInspect(){
+    var body=el('inspectBody');
+    if(!selected){
+      body.innerHTML='<span class="muted">click a key row</span>';
+      return;
+    }
+    var exp=selected.expires_at?String(selected.expires_at)+' ('+expLabel(selected)+')':'never';
+    body.innerHTML='<dl>'+
+      '<dt>key</dt><dd>'+esc(selected.key)+'</dd>'+
+      '<dt>value</dt><dd class="'+(hexMode?'valhex':'')+'">'+esc(showVal(selected.value))+'</dd>'+
+      '<dt>version</dt><dd>v'+esc(selected.version)+'</dd>'+
+      '<dt>replicas</dt><dd>'+esc(selected.replicas)+'</dd>'+
+      '<dt>expiry</dt><dd>'+esc(exp)+'</dd>'+
+      '<dt>watch</dt><dd class="muted">re-get each refresh</dd>'+
+      '</dl>';
+  }
+  function flashInspect(){
+    var p=el('inspect');
+    p.classList.remove('flash');
+    void p.offsetWidth;
+    p.classList.add('flash');
+  }
+  function loadFields(row){
+    if(!row) return;
+    el('k').value=row.key||'';
+    el('v').value=row.value==null?'':String(row.value);
+    if(row.version!=null) el('cas').value=String(row.version);
+  }
+  function selectRow(row, fromClick){
+    selected=row?{key:row.key,value:row.value,version:row.version,replicas:row.replicas,expires_at:row.expires_at}:null;
+    watchVer=selected?String(selected.version):null;
+    if(fromClick) loadFields(selected);
+    renderKeys();
+    renderInspect();
+  }
   function renderKeys(){
-    var q=(el('filter').value||'').toLowerCase();
-    var shown=allRows.filter(function(e){return !q || String(e.key).toLowerCase().indexOf(q)!==-1;});
+    var q=(el('filter').value||'').trim().toLowerCase();
+    var prefix=looksLikePrefix((el('filter').value||'').trim().replace(/\*$/,''));
+    var shown=allRows.filter(function(e){
+      if(!q) return true;
+      if(prefix) return true;
+      return String(e.key).toLowerCase().indexOf(q)!==-1;
+    });
     var rows=shown.map(function(e){
-      return '<tr><td>'+esc(e.key)+'</td><td>'+esc(e.value)+'</td><td>v'+e.version+'</td><td>'+e.replicas+'</td><td>'+esc(expLabel(e))+'</td></tr>';
+      var sel=selected && e.key===selected.key ? ' class="sel"' : '';
+      var vcls=hexMode?' class="valhex"':'';
+      return '<tr data-key="'+esc(e.key)+'"'+sel+'><td>'+esc(e.key)+'</td><td'+vcls+'>'+esc(showVal(e.value))+'</td><td>v'+e.version+'</td><td>'+e.replicas+'</td><td>'+esc(expLabel(e))+'</td></tr>';
     }).join('');
     el('keys').innerHTML=rows||'<tr><td colspan="5" class="muted">'+(allRows.length?'no keys match filter':'no keys yet')+'</td></tr>';
+  }
+  function fetchKeys(){
+    return jget(scanURL()).then(function(s){
+      allRows=s.entries||[];
+      if(selected){
+        var hit=null;
+        for(var i=0;i<allRows.length;i++){
+          if(allRows[i].key===selected.key){hit=allRows[i];break;}
+        }
+        if(hit){
+          selected.value=hit.value;
+          selected.replicas=hit.replicas;
+          selected.expires_at=hit.expires_at;
+          if(String(hit.version)!==String(selected.version)){
+            selected.version=hit.version;
+          }
+        }
+      }
+      renderKeys();
+      renderInspect();
+    }).catch(function(){});
+  }
+  function watchSelected(){
+    if(!selected || !selected.key) return;
+    var k=selected.key;
+    fetch('/kv/'+encodeURIComponent(k)).then(function(r){
+      return r.text().then(function(t){
+        var ver=hdr(r,'Version');
+        if(r.status===200){
+          selected.value=t;
+          if(ver){
+            if(watchVer!=null && ver!==watchVer){
+              selected.version=ver;
+              flashInspect();
+              msg('watch '+k+' · version '+watchVer+' → '+ver);
+            }
+            selected.version=ver;
+            watchVer=ver;
+          }
+        }else if(watchVer!=null && watchVer!=='missing'){
+          watchVer='missing';
+          selected.value='';
+          flashInspect();
+          msg('watch '+k+' · gone ('+r.status+')');
+        }
+        renderInspect();
+        renderKeys();
+      });
+    }).catch(function(){});
   }
   function refresh(){
     jget('/health').then(function(h){
@@ -196,18 +374,27 @@ const dashboardHTML = `<!doctype html>
       var hb=el('healthy');hb.textContent=h.healthy?'all nodes up':'degraded';hb.className='pill '+(h.healthy?'ok':'bad');
       el('nodes').innerHTML=(h.nodes||[]).map(function(n){
         var down=n.down || !n.up;
-        var last=n.last_ok?(' · last ok '+String(n.last_ok).replace('T',' ').replace('Z','')):'';
+        var last=n.last_ok?('last ok '+String(n.last_ok).replace('T',' ').replace(/\.\d+/,'').replace('Z','')):'no heartbeat yet';
+        var cap=n.capacity||0;
+        var load=n.load||0;
+        var pct=cap?Math.max(0,Math.min(100,Math.round(load*100))):0;
+        var hints=n.hints_pending||0;
+        var tombs=n.tombstones||0;
+        var bar=cap?('<div class="bar" title="load '+pct+'% of '+cap+'"><i style="width:'+pct+'%"></i></div>'+
+          '<div class="nm">load '+pct+'% · cap '+cap+'</div>'):'';
+        var hintLine=hints?('<div class="nm hint">pending hints '+hints+'</div>'):('<div class="nm">pending hints 0</div>');
         return '<div class="node '+(down?'down':'up')+'"><div class="nh"><span class="dot"></span>'+esc(n.addr)+'</div>'+
-          '<div class="nm">'+(n.up?('keys '+n.count+' · max v'+n.max_version+(n.tombstones?(' · tombs '+n.tombstones):'')+last):('offline'+last))+'</div></div>';
+          '<div class="nm">'+(n.up?('keys '+n.count+' · tombs '+tombs+' · max v'+n.max_version):('offline'))+'</div>'+
+          '<div class="nm">'+esc(last)+'</div>'+hintLine+bar+'</div>';
       }).join('');
       var m=h.metrics||{};
       var cells=[['reads',m.gets],['writes',m.puts],['deletes',m.dels],['crdt ops',m.mutations],
         ['quorum fails',m.quorum_failures],['read-repairs',m.read_repairs],['sweep-repairs',m.sweep_repairs],
-        ['hints stored',m.hints_stored],['hints replayed',m.hints_replayed]];
+        ['hints stored',m.hints_stored],['hints replayed',m.hints_replayed],['compacts',m.compacts]];
       el('metrics').innerHTML=cells.map(function(c){
         return '<div class="metric"><div class="k">'+c[0]+'</div><div class="v">'+(c[1]||0)+'</div></div>';
       }).join('');
-      var total=(m.gets||0)+(m.puts||0)+(m.dels||0)+(m.mutations||0);
+      var total=(m.gets||0)+(m.puts||0)+(m.dels||0)+(m.mutations||0)+(m.compacts||0);
       if(lastTotal!==null){
         hist.push(Math.max(0, total-lastTotal));
         if(hist.length>40) hist.shift();
@@ -215,40 +402,84 @@ const dashboardHTML = `<!doctype html>
       }
       lastTotal=total;
     }).catch(function(){el('healthy').textContent='gateway unreachable';el('healthy').className='pill bad';});
-    jget('/scan').then(function(s){
-      allRows=s.entries||[];
-      renderKeys();
-    }).catch(function(){});
+    fetchKeys();
+    watchSelected();
   }
   function doPut(){var k=el('k').value,v=el('v').value;if(!k){return;}
-    var hdr={};
+    var hdrs={};
     var ttl=el('ttl').value;
-    if(ttl!=='' && Number(ttl)>0){hdr['X-KV-TTL']=String(Math.floor(Number(ttl)));}
-    fetch('/kv/'+encodeURIComponent(k),{method:'PUT',body:v,headers:hdr}).then(function(r){
-      msg('put '+k+' → '+r.status+' · v'+(r.headers.get('X-KV-Version')||r.headers.get('X-Triglot-Version')||'?')+' · acks '+(r.headers.get('X-KV-Acks')||'?')+' · ['+(r.headers.get('X-KV-Replicas')||'')+']');refresh();});}
+    if(ttl!=='' && Number(ttl)>0){hdrs['X-KV-TTL']=String(Math.floor(Number(ttl)));}
+    var cas=(el('cas').value||'').trim();
+    if(cas!==''){hdrs['If-Match']=cas;}
+    fetch('/kv/'+encodeURIComponent(k),{method:'PUT',body:v,headers:hdrs}).then(function(r){
+      var detail='v'+(hdr(r,'Version')||'?')+' · acks '+(hdr(r,'Acks')||'?')+' · ['+(hdr(r,'Replicas')||'')+']';
+      if(r.status===409) detail='conflict current v'+(hdr(r,'Version')||'?');
+      msg('put '+k+' → '+r.status+' · '+detail);
+      logOp('put', r.status, k+' '+detail);
+      refresh();
+    });}
   function doGet(){var k=el('k').value;if(!k){return;}
     fetch('/kv/'+encodeURIComponent(k)).then(function(r){return r.text().then(function(t){
-      if(r.status===200){var rep=r.headers.get('X-KV-Repaired')||r.headers.get('X-Triglot-Repaired');var exp=r.headers.get('X-KV-Expires-At');
-        msg('get '+k+' → "'+t+'" · v'+(r.headers.get('X-KV-Version')||'?')+' · responders ['+(r.headers.get('X-KV-Responders')||'')+']'+(rep?' · read-repaired '+rep:'')+(exp?' · expires '+exp:''));}
-      else{msg('get '+k+' → '+r.status+' '+t.trim());}refresh();});});}
+      if(r.status===200){
+        el('v').value=t;
+        var ver=hdr(r,'Version');
+        if(ver) el('cas').value=ver;
+        var rep=hdr(r,'Repaired');var exp=hdr(r,'Expires-At');
+        var detail='"'+t+'" · v'+(ver||'?')+' · responders ['+(hdr(r,'Responders')||'')+']'+(rep?' · repaired '+rep:'')+(exp?' · expires '+exp:'');
+        msg('get '+k+' → '+detail);
+        logOp('get', r.status, k+' v'+(ver||'?')+' '+t);
+        if(selected && selected.key===k){
+          if(watchVer!=null && ver && ver!==watchVer) flashInspect();
+          selected.value=t; selected.version=ver||selected.version; watchVer=ver||watchVer;
+          renderInspect();
+        }
+      }else{
+        msg('get '+k+' → '+r.status+' '+t.trim());
+        logOp('get', r.status, k+' '+t.trim());
+      }
+      refresh();
+    });});}
   function doDel(){var k=el('k').value;if(!k){return;}
-    fetch('/kv/'+encodeURIComponent(k),{method:'DELETE'}).then(function(r){msg('delete '+k+' → '+r.status+' · v'+(r.headers.get('X-KV-Version')||'?'));refresh();});}
+    fetch('/kv/'+encodeURIComponent(k),{method:'DELETE'}).then(function(r){
+      msg('delete '+k+' → '+r.status+' · v'+(hdr(r,'Version')||'?'));
+      logOp('del', r.status, k+' v'+(hdr(r,'Version')||'?'));
+      if(selected && selected.key===k){selected=null;watchVer=null;renderInspect();}
+      refresh();
+    });}
   function doRoute(){var k=el('k').value;if(!k){return;}
-    jget('/route/'+encodeURIComponent(k)).then(function(o){msg('route '+k+' → '+(o.replicas||[]).join(', '));});}
+    jget('/route/'+encodeURIComponent(k)).then(function(o){
+      var d=(o.replicas||[]).join(', ');
+      msg('route '+k+' → '+d);
+      logOp('route', 200, k+' → '+d);
+    });}
+  function doCompact(){
+    fetch('/admin/compact',{method:'POST'}).then(function(r){return r.json().then(function(j){
+      var d='compacted '+(j.compacted||0)+(j.errors&&j.errors.length?(' · errs '+j.errors.join('; ')): '');
+      msg('compact → '+r.status+' · '+d);
+      logOp('compact', r.status, d);
+      refresh();
+    }).catch(function(){msg('compact → '+r.status);logOp('compact', r.status, '');});});}
   function doExport(){
     fetch('/export').then(function(r){return r.blob();}).then(function(b){
       var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='kvstore-export.json';a.click();
-      msg('exported JSON');});}
+      msg('exported JSON');logOp('export', 200, 'json');});}
   function doImport(file){
     file.text().then(function(t){
       return fetch('/import',{method:'POST',headers:{'Content-Type':'application/json'},body:t});
     }).then(function(r){return r.json().then(function(j){
       msg('import → '+r.status+' · imported '+(j.imported||0)+' · skipped '+(j.skipped||0));
+      logOp('import', r.status, 'imported '+(j.imported||0));
       refresh();});});}
   function doAdd(){var a=el('naddr').value;if(!a){return;}
-    fetch('/admin/nodes?addr='+encodeURIComponent(a),{method:'POST'}).then(function(r){return r.text().then(function(t){msg('add node '+a+' → '+r.status+' '+t.trim());refresh();});});}
+    fetch('/admin/nodes?addr='+encodeURIComponent(a),{method:'POST'}).then(function(r){return r.text().then(function(t){
+      msg('add node '+a+' → '+r.status+' '+t.trim());
+      logOp('add node', r.status, a);
+      refresh();});});}
   function doRm(){var a=el('naddr').value;if(!a){return;}
-    fetch('/admin/nodes/'+encodeURIComponent(a),{method:'DELETE'}).then(function(r){return r.text().then(function(t){msg('remove node '+a+' → '+r.status+' '+t.trim());refresh();});});}
+    fetch('/admin/nodes/'+encodeURIComponent(a),{method:'DELETE'}).then(function(r){return r.text().then(function(t){
+      msg('remove node '+a+' → '+r.status+' '+t.trim());
+      logOp('rm node', r.status, a);
+      refresh();});});}
   function cdo(delta){
     var k=el('ck').value;if(!k){return;}
     var u='/crdt/counter/'+encodeURIComponent(k)+(delta!=null?('?delta='+delta):'');
@@ -268,10 +499,33 @@ const dashboardHTML = `<!doctype html>
   el('get').addEventListener('click',doGet);
   el('del').addEventListener('click',doDel);
   el('route').addEventListener('click',doRoute);
+  el('compact').addEventListener('click',doCompact);
   el('export').addEventListener('click',doExport);
   el('importBtn').addEventListener('click',function(){el('importFile').click();});
   el('importFile').addEventListener('change',function(){if(this.files&&this.files[0]){doImport(this.files[0]);this.value='';}});
-  el('filter').addEventListener('input',renderKeys);
+  el('filter').addEventListener('input',function(){
+    renderKeys();
+    if(filterTimer) clearTimeout(filterTimer);
+    filterTimer=setTimeout(fetchKeys, 220);
+  });
+  el('hexbtn').addEventListener('click',function(){
+    hexMode=!hexMode;
+    el('hexbtn').textContent=hexMode?'values: hex':'values: utf-8';
+    el('hexbtn').className=hexMode?'on':'ghost';
+    renderKeys();renderInspect();
+  });
+  el('keys').addEventListener('click',function(ev){
+    var tr=ev.target.closest('tr');
+    if(!tr) return;
+    var key=tr.getAttribute('data-key');
+    if(!key) return;
+    var row=null;
+    for(var i=0;i<allRows.length;i++){if(allRows[i].key===key){row=allRows[i];break;}}
+    if(row) selectRow(row, true);
+  });
+  el('iget').addEventListener('click',function(){if(selected){el('k').value=selected.key;doGet();}});
+  el('idel').addEventListener('click',function(){if(selected){el('k').value=selected.key;doDel();}});
+  el('iroute').addEventListener('click',function(){if(selected){el('k').value=selected.key;doRoute();}});
   el('addn').addEventListener('click',doAdd);
   el('rmn').addEventListener('click',doRm);
   el('cinc').addEventListener('click',function(){cdo(1);});

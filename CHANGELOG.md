@@ -3,6 +3,45 @@
 All notable changes to KVStore are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.1.0] — 2026-09-02
+
+Tombstone GC without grow, an operator-facing control room, and CLI watch.
+
+### Added
+
+**Engine compact (C)**
+
+- `kv_compact(db)` rehashes at the **same** capacity so tombstones and expired
+  keys are dropped (GC without grow). Returns `KV_OK` / `KV_ERROR`.
+
+**Wire protocol**
+
+- `COMPACT` (op 9): no payload. kvnode calls `kv_compact`. Go client
+  `Compact() error`.
+
+**Coordinator**
+
+- `CompactAll()` best-effort compact of every live node. Metric `Compacts`.
+- `HintsPending() map[string]int` — queued hints per node (not just lifetime
+  counters). `/health` nodes include `hints_pending`.
+- `/health` nodes include `capacity` and `load` (`count/capacity`) from STAT.
+
+**HTTP / dashboard / CLI**
+
+- `POST /admin/compact`.
+- Control room: click a key to inspect (key, value, version, replicas, expiry;
+  load into put/get; get/del/route); ops log of the last ~24 actions; CAS
+  `If-Match` on put; prefix filter calls `GET /scan?prefix=`; UTF-8/hex value
+  toggle; per-node heartbeat, keys, tombs, load bar, pending hints; Compact
+  button; watch the selected key each refresh and flash on version change.
+- CLI: `kvstore compact` and `kvstore watch KEY` (poll get every second until
+  Ctrl-C; print version+value).
+
+### Tests
+
+- Engine: fill, delete many, compact, tombstones drop, remaining keys gettable.
+- HTTP: compact + health JSON fields (extra fields tolerated).
+
 ## [1.0.0] — 2026-09-02
 
 Rename to **KVStore** plus engine v3, native TTL, hinted handoff, and heartbeat

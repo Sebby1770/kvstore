@@ -61,4 +61,6 @@ type Node interface {
 	Scan() ([]Entry, error)
 	ScanAll() ([]Entry, error)
 	Stat() (Stat, error)
+	// Compact GCs tombstones and expired keys at the current capacity.
+	Compact() error
 }

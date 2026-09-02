@@ -19,6 +19,7 @@ const (
 	OpStat    byte = 6
 	OpPutX    byte = 7
 	OpScanAll byte = 8
+	OpCompact byte = 9 // no payload; GC tombstones at current capacity
 
 	StatusOK       byte = 0
 	StatusNotFound byte = 1

@@ -15,6 +15,7 @@
 //   STAT     : 1B op
 //   PUTX     : 1B op | 4B key_len | key | 8B version | 8B expires_at | 4B val_len | val
 //   SCAN_ALL : 1B op   (includes tombstones)
+//   COMPACT  : 1B op   (GC tombstones/expired keys at current capacity)
 //
 // Response:
 //   1B status (0=OK, 1=NOT_FOUND, 2=ERROR, 3=DELETED)
@@ -37,6 +38,7 @@ pub const OP_PING:     u8 = 5;
 pub const OP_STAT:     u8 = 6;
 pub const OP_PUTX:     u8 = 7;
 pub const OP_SCAN_ALL: u8 = 8;
+pub const OP_COMPACT:  u8 = 9;
 
 pub const STATUS_OK:        u8 = 0;
 pub const STATUS_NOT_FOUND: u8 = 1;

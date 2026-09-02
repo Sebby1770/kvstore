@@ -347,6 +347,25 @@ func (c *Client) ScanAll() ([]kv.Entry, error) {
 	return c.scanOp(proto.OpScanAll, true)
 }
 
+func (c *Client) Compact() error {
+	return c.withConn(func() error {
+		if err := proto.WriteU8(c.w, proto.OpCompact); err != nil {
+			return err
+		}
+		if err := c.w.Flush(); err != nil {
+			return err
+		}
+		s, err := proto.ReadU8(c.r)
+		if err != nil {
+			return err
+		}
+		if s != proto.StatusOK {
+			return fmt.Errorf("compact: %s", proto.StatusString(s))
+		}
+		return nil
+	})
+}
+
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

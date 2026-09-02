@@ -198,6 +198,11 @@ fn handle(stream: std::net::TcpStream, db: Arc<Mutex<Db>>) -> io::Result<()> {
                 write_u32(&mut w, SCAN_TERMINATOR)?;
                 w.flush()?;
             }
+            OP_COMPACT => {
+                let res = { db.lock().unwrap().compact() };
+                write_u8(&mut w, if res.is_ok() { STATUS_OK } else { STATUS_ERROR })?;
+                w.flush()?;
+            }
             _ => {
                 write_u8(&mut w, STATUS_ERROR)?;
                 w.flush()?;

@@ -87,6 +87,10 @@ int      kv_scan_all(kv_db *db, kv_scan_all_cb cb, void *ctx);
  * tombstones and expired keys are dropped (GC). */
 int      kv_rehash(kv_db *db, uint32_t new_capacity);
 
+/* GC without grow: rehash at the current capacity so tombstones and
+ * expired keys are dropped. Returns KV_OK or KV_ERROR. */
+int      kv_compact(kv_db *db);
+
 uint32_t kv_count(const kv_db *db);
 uint32_t kv_capacity(const kv_db *db);
 uint32_t kv_tombstones(const kv_db *db);

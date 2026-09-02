@@ -74,6 +74,7 @@ type Cluster struct {
 	mGets, mPuts, mDels, mMutations    uint64
 	mQuorumFails, mRepairs, mSweepReps uint64
 	mHintsStored, mHintsReplayed       uint64
+	mCompacts                          uint64
 }
 
 // Metrics is a snapshot of the coordinator's operational counters.
@@ -87,6 +88,7 @@ type Metrics struct {
 	SweepRepairs   uint64 `json:"sweep_repairs"`
 	HintsStored    uint64 `json:"hints_stored"`
 	HintsReplayed  uint64 `json:"hints_replayed"`
+	Compacts       uint64 `json:"compacts"`
 }
 
 func (c *Cluster) Metrics() Metrics {
@@ -100,6 +102,7 @@ func (c *Cluster) Metrics() Metrics {
 		SweepRepairs:   atomic.LoadUint64(&c.mSweepReps),
 		HintsStored:    atomic.LoadUint64(&c.mHintsStored),
 		HintsReplayed:  atomic.LoadUint64(&c.mHintsReplayed),
+		Compacts:       atomic.LoadUint64(&c.mCompacts),
 	}
 }
 
@@ -811,14 +814,17 @@ func (c *Cluster) RepairSweep() (int, []string) {
 }
 
 type NodeHealth struct {
-	Addr       string     `json:"addr"`
-	Up         bool       `json:"up"`
-	Down       bool       `json:"down"`
-	LastOK     *time.Time `json:"last_ok,omitempty"`
-	Err        string     `json:"err,omitempty"`
-	Count      uint32     `json:"count"`
-	MaxVersion uint64     `json:"max_version"`
-	Tombstones uint32     `json:"tombstones,omitempty"`
+	Addr         string     `json:"addr"`
+	Up           bool       `json:"up"`
+	Down         bool       `json:"down"`
+	LastOK       *time.Time `json:"last_ok,omitempty"`
+	Err          string     `json:"err,omitempty"`
+	Count        uint32     `json:"count"`
+	MaxVersion   uint64     `json:"max_version"`
+	Tombstones   uint32     `json:"tombstones,omitempty"`
+	Capacity     uint32     `json:"capacity,omitempty"`
+	Load         float64    `json:"load,omitempty"`
+	HintsPending int        `json:"hints_pending"`
 }
 
 // Health pings every node and pulls its stats. Also refreshes heartbeat state.
@@ -842,6 +848,10 @@ func (c *Cluster) Health() ([]NodeHealth, bool) {
 				h.Count = st.Count
 				h.MaxVersion = st.MaxVersion
 				h.Tombstones = st.Tombstones
+				if st.Capacity > 0 {
+					h.Capacity = st.Capacity
+					h.Load = float64(st.Count) / float64(st.Capacity)
+				}
 			}
 			if t := c.lastOK(a); !t.IsZero() {
 				tcopy := t
@@ -853,11 +863,64 @@ func (c *Cluster) Health() ([]NodeHealth, bool) {
 	}
 	wg.Wait()
 
+	pending := c.HintsPending()
 	allUp := true
-	for _, h := range out {
+	for i, h := range out {
+		out[i].HintsPending = pending[h.Addr]
 		if !h.Up || h.Down {
 			allUp = false
 		}
 	}
 	return out, allUp
+}
+
+// HintsPending is the number of queued (not yet replayed) hints per node.
+func (c *Cluster) HintsPending() map[string]int {
+	c.hintsMu.Lock()
+	defer c.hintsMu.Unlock()
+	out := make(map[string]int, len(c.hints))
+	for addr, q := range c.hints {
+		if n := len(q); n > 0 {
+			out[addr] = n
+		}
+	}
+	return out
+}
+
+// CompactAll best-effort rehashes every live node at its current capacity
+// so tombstones and expired keys are dropped. Down nodes are skipped.
+func (c *Cluster) CompactAll() (int, []string) {
+	atomic.AddUint64(&c.mCompacts, 1)
+	m := c.snap()
+	var (
+		mu   sync.Mutex
+		wg   sync.WaitGroup
+		n    int
+		errs []string
+	)
+	for _, addr := range m.addrs {
+		if c.IsDown(addr) {
+			continue
+		}
+		node := m.nodes[addr]
+		if node == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(addr string, node kv.Node) {
+			defer wg.Done()
+			if err := node.Compact(); err != nil {
+				mu.Lock()
+				errs = append(errs, addr+": "+err.Error())
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			n++
+			mu.Unlock()
+		}(addr, node)
+	}
+	wg.Wait()
+	sort.Strings(errs)
+	return n, errs
 }

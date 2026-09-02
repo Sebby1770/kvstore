@@ -11,6 +11,8 @@
 //	kvstore metrics
 //	kvstore export
 //	kvstore import          (JSON on stdin)
+//	kvstore compact
+//	kvstore watch   KEY
 //	kvstore bench   [N]
 package main
 
@@ -24,8 +26,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -43,7 +47,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "kvstore [--gw URL] [--timeout D] <cmd> [args...]\n")
 		fmt.Fprintf(os.Stderr, "  get KEY | put KEY VALUE [--ttl 10s] | cas KEY VER VALUE | del KEY\n")
 		fmt.Fprintf(os.Stderr, "  expire KEY DURATION | scan [prefix] | route KEY | health | metrics\n")
-		fmt.Fprintf(os.Stderr, "  export | import | bench [N]\n")
+		fmt.Fprintf(os.Stderr, "  export | import | compact | watch KEY | bench [N]\n")
 	}
 	flag.Parse()
 
@@ -301,6 +305,58 @@ func main() {
 			fmt.Println(pretty.String())
 		} else {
 			os.Stdout.Write(body)
+		}
+
+	case "compact":
+		body, _, status, err := do(c, "POST", *gw+"/admin/compact", nil, nil)
+		check(err)
+		var pretty bytes.Buffer
+		if json.Indent(&pretty, body, "", "  ") == nil {
+			fmt.Println(pretty.String())
+		} else {
+			os.Stdout.Write(body)
+			if !bytes.HasSuffix(body, []byte{'\n'}) {
+				fmt.Println()
+			}
+		}
+		if status != http.StatusOK {
+			os.Exit(1)
+		}
+
+	case "watch":
+		if len(args) != 1 {
+			fail("watch KEY")
+		}
+		key := args[0]
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		poll := func() {
+			body, hdr, status, err := do(c, "GET", *gw+"/kv/"+url.PathEscape(key), nil, nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "watch: %v\n", err)
+				return
+			}
+			if status == http.StatusNotFound {
+				fmt.Println("(missing)")
+				return
+			}
+			if status != http.StatusOK {
+				fmt.Fprintf(os.Stderr, "watch: %s %s\n", http.StatusText(status), strings.TrimSpace(string(body)))
+				return
+			}
+			val := strings.TrimRight(string(body), "\n")
+			fmt.Printf("v%s %s\n", hdrKV(hdr, "Version"), val)
+		}
+		poll()
+		for {
+			select {
+			case <-sig:
+				return
+			case <-ticker.C:
+				poll()
+			}
 		}
 
 	case "bench":

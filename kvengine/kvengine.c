@@ -14,8 +14,9 @@
 //
 // Format v3 (MAGIC KVST0003): slots gained expires_at (unix seconds, 0 = never).
 // Expired occupied slots are lazily tombstoned on get/scan. kv_rehash drops
-// tombstones (GC) and copies only live non-expired keys. Inserts that would
-// return KV_FULL double capacity via rehash and retry once.
+// tombstones (GC) and copies only live non-expired keys. kv_compact rehashes
+// at the current capacity (GC without grow). Inserts that would return KV_FULL
+// double capacity via rehash and retry once.
 
 #include "kvengine.h"
 
@@ -533,6 +534,11 @@ int kv_rehash(kv_db *db, uint32_t new_capacity) {
     sync_header(db);
     free(recs);
     return rc;
+}
+
+int kv_compact(kv_db *db) {
+    if (!db) return KV_ERROR;
+    return kv_rehash(db, db->hdr->capacity);
 }
 
 uint32_t kv_count(const kv_db *db)      { return db ? db->hdr->count      : 0; }

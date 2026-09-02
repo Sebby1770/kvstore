@@ -68,6 +68,11 @@ func (g *gateway) handleAddNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"added": addr, "nodes": g.cluster.Addrs(), "rf": g.cluster.RF()})
 }
 
+func (g *gateway) handleCompact(w http.ResponseWriter, r *http.Request) {
+	n, errs := g.cluster.CompactAll()
+	writeJSON(w, map[string]any{"compacted": n, "errors": errs})
+}
+
 func (g *gateway) handleRemoveNode(w http.ResponseWriter, r *http.Request) {
 	addr := r.PathValue("addr")
 	if !g.cluster.RemoveNode(addr) {
@@ -362,6 +367,7 @@ func (g *gateway) routes() http.Handler {
 	mux.HandleFunc("GET /admin/nodes", g.handleListNodes)
 	mux.HandleFunc("POST /admin/nodes", g.handleAddNode)
 	mux.HandleFunc("DELETE /admin/nodes/{addr}", g.handleRemoveNode)
+	mux.HandleFunc("POST /admin/compact", g.handleCompact)
 	mux.HandleFunc("GET /dashboard", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(dashboardHTML))
@@ -377,6 +383,7 @@ func (g *gateway) routes() http.Handler {
 		fmt.Fprintf(w, "snapshot: GET /export, POST /import\n")
 		fmt.Fprintf(w, "crdt: GET|POST /crdt/counter/{key}?delta=N, GET|POST /crdt/set/{key}?add=x&remove=y\n")
 		fmt.Fprintf(w, "admin: GET /admin/nodes, POST /admin/nodes?addr=host:port, DELETE /admin/nodes/{addr}\n")
+		fmt.Fprintf(w, "compact: POST /admin/compact  (GC tombstones on every live node)\n")
 	})
 	return mux
 }
@@ -415,6 +422,7 @@ func (g *gateway) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		{"kvstore_sweep_repairs_total", "replicas healed by anti-entropy", m.SweepRepairs},
 		{"kvstore_hints_stored_total", "hinted-handoff records stored", m.HintsStored},
 		{"kvstore_hints_replayed_total", "hinted-handoff records replayed", m.HintsReplayed},
+		{"kvstore_compacts_total", "cluster compact (tombstone GC) operations", m.Compacts},
 	}
 	for _, c := range counters {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", c.name, c.help, c.name, c.name, c.val)

@@ -1,6 +1,6 @@
 // Smoke + regression tests for the v3 storage engine: last-writer-wins,
-// versioned tombstones, native TTL, lazy expiry, rehash/GC, auto-grow, and
-// header CRC detection.
+// versioned tombstones, native TTL, lazy expiry, rehash/GC, compact, auto-grow,
+// and header CRC detection.
 
 #include "kvengine.h"
 
@@ -184,6 +184,39 @@ int main(void) {
         expect_val(db, kbuf, "v", (uint64_t)(i + 1));
     }
     kv_close(db);
+
+    // --- Compact: fill, delete many, GC tombstones at the same capacity. ---
+    unlink(path);
+    db = NULL;
+    assert(kv_open(path, 32, &db) == KV_OK);
+    char ck[8];
+    for (int i = 0; i < 10; i++) {
+        snprintf(ck, sizeof ck, "k%02d", i);
+        assert(kv_put(db, ck, 3, "v", 1, (uint64_t)(i + 1)) == KV_OK);
+    }
+    assert(kv_count(db) == 10);
+    for (int i = 0; i < 7; i++) {
+        snprintf(ck, sizeof ck, "k%02d", i);
+        assert(kv_del(db, ck, 3, (uint64_t)(50 + i)) == KV_OK);
+    }
+    assert(kv_count(db) == 3);
+    assert(kv_tombstones(db) == 7);
+    uint32_t cap_before = kv_capacity(db);
+    assert(kv_compact(db) == KV_OK);
+    assert(kv_capacity(db) == cap_before);
+    assert(kv_tombstones(db) == 0);
+    assert(kv_count(db) == 3);
+    for (int i = 7; i < 10; i++) {
+        snprintf(ck, sizeof ck, "k%02d", i);
+        expect_val(db, ck, "v", (uint64_t)(i + 1));
+    }
+    for (int i = 0; i < 7; i++) {
+        snprintf(ck, sizeof ck, "k%02d", i);
+        assert(kv_get(db, ck, 3, buf, sizeof buf, &n, &ver, &exp) == KV_NOT_FOUND);
+    }
+    kv_close(db);
+
+    assert(kv_compact(NULL) == KV_ERROR);
 
     // --- CRC / magic: a torn or forged header is KV_BAD_FILE. ---
     unlink(path);
