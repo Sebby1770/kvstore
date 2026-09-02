@@ -1,0 +1,20 @@
+# Storage node: C engine statically linked into the Rust TCP daemon.
+# Build context is the repository root.
+FROM rust:1.78-bookworm AS build
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY kvengine ./kvengine
+COPY kvnode ./kvnode
+
+WORKDIR /src/kvengine
+RUN cc -std=c11 -O2 -fPIC -c kvengine.c -o kvengine.o && ar rcs libkvengine.a kvengine.o
+
+WORKDIR /src/kvnode
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+COPY --from=build /src/kvnode/target/release/kvnode /usr/local/bin/kvnode
+ENTRYPOINT ["kvnode"]

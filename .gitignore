@@ -1,0 +1,8 @@
+bin/
+kvengine/*.o
+kvengine/*.a
+kvengine/kvengine_test
+kvnode/target/
+**/*.db
+.DS_Store
+.cache/

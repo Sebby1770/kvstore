@@ -1,0 +1,67 @@
+# Four kvnodes + one gateway, RF=3 R=2 W=2, dashboard on :8090.
+#
+#   docker compose up --build
+#   curl http://127.0.0.1:8090/health
+#
+# Intended for Linux. On macOS the images still run inside a Linux VM
+# (Docker Desktop), so compose usually works; if you would rather not
+# fight cgo/mmap on the host itself, use `make demo` for a native cluster.
+services:
+  n0:
+    build:
+      context: .
+      dockerfile: Dockerfile.kvnode
+    command: ["--listen", "0.0.0.0:7070", "--db", "/data/n0.db", "--capacity", "4096"]
+    volumes: [n0:/data]
+    restart: unless-stopped
+  n1:
+    build:
+      context: .
+      dockerfile: Dockerfile.kvnode
+    command: ["--listen", "0.0.0.0:7070", "--db", "/data/n1.db", "--capacity", "4096"]
+    volumes: [n1:/data]
+    restart: unless-stopped
+  n2:
+    build:
+      context: .
+      dockerfile: Dockerfile.kvnode
+    command: ["--listen", "0.0.0.0:7070", "--db", "/data/n2.db", "--capacity", "4096"]
+    volumes: [n2:/data]
+    restart: unless-stopped
+  n3:
+    build:
+      context: .
+      dockerfile: Dockerfile.kvnode
+    command: ["--listen", "0.0.0.0:7070", "--db", "/data/n3.db", "--capacity", "4096"]
+    volumes: [n3:/data]
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    command:
+      - --listen
+      - :8090
+      - --nodes
+      - n0:7070,n1:7070,n2:7070,n3:7070
+      - --rf
+      - "3"
+      - --read
+      - "2"
+      - --write
+      - "2"
+      - --anti-entropy
+      - 5s
+      - --heartbeat
+      - 2s
+    ports:
+      - "8090:8090"
+    depends_on: [n0, n1, n2, n3]
+    restart: unless-stopped
+
+volumes:
+  n0:
+  n1:
+  n2:
+  n3:

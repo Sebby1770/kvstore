@@ -1,0 +1,8 @@
+.git
+bin
+kvnode/target
+**/*.db
+**/*.o
+**/*.a
+kvengine/kvengine_test
+**/.DS_Store

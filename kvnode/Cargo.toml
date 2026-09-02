@@ -1,0 +1,13 @@
+[package]
+name = "kvnode"
+version = "0.1.0"
+edition = "2021"
+description = "KVStore node — TCP server in front of a C storage engine"
+
+[[bin]]
+name = "kvnode"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+strip = true
