@@ -43,12 +43,12 @@ func (c *Cluster) cas(key []byte, expectedVersion uint64, val []byte, expiresAt 
 		}
 		responders++
 		c.clock.witness(rd.res.Version)
-		if !haveBest || rd.res.Version > best.Version {
+		if !haveBest || beats(rd.res, best) {
 			best = rd.res
 			haveBest = true
 		}
 	}
-	if responders < c.R() {
+	if responders < c.mintQuorum(len(addrs)) {
 		atomic.AddUint64(&c.mQuorumFails, 1)
 		return WriteMeta{Replicas: addrs, Required: c.W()}, ErrQuorum
 	}
