@@ -1,4 +1,4 @@
-package main
+package httpapi
 
 // dashboardHTML is a self-contained control room served at GET /dashboard.
 // No build step, no dependencies — polls the gateway's own JSON endpoints.

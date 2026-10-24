@@ -1,4 +1,4 @@
-package main
+package httpapi
 
 import (
 	"bytes"
@@ -135,8 +135,8 @@ func testGateway() (*httptest.Server, *cluster.Cluster) {
 		nodes[a] = newMem(a)
 	}
 	cl := cluster.New(nodes, addrs, 3, 2, 2)
-	g := &gateway{cluster: cl, timeout: time.Second}
-	return httptest.NewServer(g.routes()), cl
+	g := New(cl, Options{Timeout: time.Second})
+	return httptest.NewServer(g.Handler()), cl
 }
 
 func TestHTTPCompareAndSet(t *testing.T) {
