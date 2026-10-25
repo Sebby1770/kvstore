@@ -76,16 +76,17 @@ type stream struct {
 	stopErr   *StreamResetError
 
 	// ---- receive half ----
-	ready      []byte  // contiguous bytes from readOff, ready to read
-	readOff    uint64  // offset of ready[0]; app has consumed everything below
-	chunks     []chunk // out-of-order data beyond readOff+len(ready)
-	recvHigh   uint64  // highest offset+1 seen (for connection flow control)
-	finalSize  int64   // -1 until FIN or RESET reveals it
-	recvMax    uint64  // our advertised MAX_STREAM_DATA
-	window     uint64  // receive window to keep ahead of readOff
-	resetErr   *StreamResetError
-	readClosed bool // app cancelled reading (we sent STOP_SENDING)
-	needMax    bool // a MAX_STREAM_DATA update is due
+	ready          []byte  // contiguous bytes from readOff, ready to read
+	readOff        uint64  // offset of ready[0]; app has consumed everything below
+	chunks         []chunk // out-of-order data beyond readOff+len(ready)
+	recvHigh       uint64  // highest offset+1 seen (for connection flow control)
+	finalSize      int64   // -1 until FIN or RESET reveals it
+	recvMax        uint64  // our advertised MAX_STREAM_DATA
+	window         uint64  // receive window to keep ahead of readOff
+	resetErr       *StreamResetError
+	resetDelivered bool // the application has read resetErr
+	readClosed     bool // app cancelled reading (we sent STOP_SENDING)
+	needMax        bool // a MAX_STREAM_DATA update is due
 }
 
 func newStream(id, sendMax, recvWindow uint64) *stream {
@@ -149,8 +150,14 @@ func (s *stream) sendDone() bool {
 
 // recvDone: everything the peer will send has been consumed (or abandoned).
 func (s *stream) recvDone() bool {
-	if s.resetErr != nil || s.readClosed {
+	if s.readClosed {
 		return true
+	}
+	if s.resetErr != nil {
+		// Keep the stream until the application has seen the reset;
+		// otherwise its next read finds no stream and mistakes the abort
+		// for a clean end.
+		return s.resetDelivered
 	}
 	return s.finalSize >= 0 && s.readOff == uint64(s.finalSize) && len(s.ready) == 0
 }
@@ -215,6 +222,7 @@ func (s *stream) read(p []byte) (int, error) {
 		return 0, ErrReadClosed
 	}
 	if s.resetErr != nil {
+		s.resetDelivered = true
 		return 0, s.resetErr
 	}
 	if len(s.ready) == 0 {
