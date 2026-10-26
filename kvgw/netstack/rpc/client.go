@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"time"
 
 	"github.com/Sebby1770/kvstore/kvgw/netstack/endpoint"
@@ -94,6 +95,15 @@ func (c *Client) do(ctx context.Context, addr, method string, req []byte, opts [
 	}
 }
 
+// deadlineOr is ctxErr, treating a stream timeout before the context has
+// noticed its own deadline as that deadline.
+func deadlineOr(ctx context.Context) error {
+	if ctx.Err() == nil || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return &Error{Code: DeadlineExceeded, Message: "deadline exceeded"}
+	}
+	return ctxErr(ctx)
+}
+
 func ctxErr(ctx context.Context) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return &Error{Code: DeadlineExceeded, Message: "deadline exceeded"}
@@ -150,8 +160,8 @@ func (c *Client) once(ctx context.Context, addr, method string, payload []byte, 
 	defer stop()
 
 	if _, err := st.Write(req.encode()); err != nil {
-		if ctx.Err() != nil {
-			return ctxErr(ctx), true
+		if ctx.Err() != nil || errors.Is(err, os.ErrDeadlineExceeded) {
+			return deadlineOr(ctx), true
 		}
 		return &Error{Code: Unavailable, Message: "send: " + err.Error()}, true
 	}
@@ -160,8 +170,10 @@ func (c *Client) once(ctx context.Context, addr, method string, payload []byte, 
 		kind, body, err := readFrame(r, c.opts.MaxMessage)
 		if err != nil {
 			st.Reset(uint64(ErrCode))
-			if ctx.Err() != nil {
-				return ctxErr(ctx), true
+			// The stream deadline and the context deadline are the same
+			// instant; whichever timer fires first, report the deadline.
+			if ctx.Err() != nil || errors.Is(err, os.ErrDeadlineExceeded) {
+				return deadlineOr(ctx), true
 			}
 			var e *Error
 			if errors.As(err, &e) {
