@@ -60,11 +60,21 @@
 // acknowledged for a probe timeout (srtt + 4·rttvar + max_ack_delay, doubling
 // each time), the oldest outstanding data is re-sent as a probe. RTT is
 // estimated with the RFC's smoothed/variance filter, discounting the peer's
-// reported ACK delay. The congestion controller is NewReno or CUBIC (RFC
-// 9438, with the Reno-friendly region and fast convergence); both use one
-// reduction per recovery period, do not grow while application-limited, and
-// collapse to the minimum window on persistent congestion. A token-bucket
-// pacer releases the window at 1.25 × cwnd / srtt.
+// reported ACK delay. Three congestion controllers plug in:
+//
+//   - NewReno and CUBIC (RFC 9438, with the Reno-friendly region and fast
+//     convergence): loss-based, one reduction per recovery period, no growth
+//     while application-limited, minimum window on persistent congestion.
+//   - BBR (v1, with BBRv2's loss-based Startup exit): model-based. Delivery
+//     rate is sampled per ACK (draft-cheng-iccrg-delivery-rate-estimation,
+//     with application-limited marking); BtlBw is the 10-round max of those
+//     samples, RTprop the 10-second min RTT; it paces at gain × BtlBw through
+//     Startup, Drain, the ProbeBW gain cycle and ProbeRTT, and ignores
+//     random loss. At 2% random loss on a 2 MB/s, 40ms path it moves data
+//     about eight times faster than NewReno (TestBBRToleratesRandomLoss).
+//
+// A token-bucket pacer releases the window at the controller's rate (BBR) or
+// 1.25 × cwnd / srtt.
 //
 // # Lifecycle
 //

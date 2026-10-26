@@ -102,6 +102,42 @@ type sentPacket struct {
 	ackEliciting bool
 	frames       []sentFrame
 	acked, lost  bool
+
+	// Delivery-rate bookkeeping (draft-cheng-iccrg-delivery-rate-estimation):
+	// the connection's delivery counters at the moment this packet was sent.
+	priorDelivered     uint64
+	priorDeliveredTime time.Time
+	firstSentTime      time.Time
+	appLimited         bool
+}
+
+// rateSample is one delivery-rate measurement, taken per ACK from the most
+// recently sent packet it acknowledges.
+type rateSample struct {
+	rate           float64 // bytes per second (0 = no valid sample)
+	rtt            time.Duration
+	delivered      uint64 // total bytes delivered after this ACK
+	priorDelivered uint64 // delivered when the sampled packet was sent
+	acked          int    // bytes newly acknowledged by this ACK
+	inflight       int    // bytes in flight after this ACK
+	appLimited     bool   // the sampled packet was sent while application-limited
+}
+
+// rateSampler is implemented by controllers that want delivery-rate samples.
+type rateSampler interface {
+	onRateSample(now time.Time, rs rateSample)
+}
+
+// lossObserver is implemented by controllers that want per-packet loss
+// counts (OnLoss reports one congestion event per batch).
+type lossObserver interface {
+	onPacketsLost(now time.Time, packets, bytes int)
+}
+
+// pacingController is implemented by controllers that set their own pacing
+// rate (bytes per second; 0 means use the default 1.25 × cwnd / srtt).
+type pacingController interface {
+	pacingRate() float64
 }
 
 // recovery tracks ack-eliciting packets in flight.
@@ -116,6 +152,14 @@ type recovery struct {
 	rtt           rttStats
 	cc            CongestionController
 
+	// delivery-rate estimation
+	delivered     uint64
+	deliveredTime time.Time
+	firstSentTime time.Time
+	appLimited    uint64 // nonzero: application-limited until delivered passes it
+
+	recoveryStart time.Time // start of the current loss recovery period
+
 	// stats
 	lost, ptos, congestionEvents uint64
 }
@@ -124,6 +168,12 @@ func (r *recovery) onSent(p *sentPacket) {
 	if !p.ackEliciting {
 		return
 	}
+	if r.bytesInFlight == 0 {
+		// A new flight starts: rate intervals must not span the idle gap.
+		r.firstSentTime, r.deliveredTime = p.sentAt, p.sentAt
+	}
+	p.priorDelivered, p.priorDeliveredTime, p.firstSentTime = r.delivered, r.deliveredTime, r.firstSentTime
+	p.appLimited = r.appLimited != 0
 	r.sent = append(r.sent, p)
 	r.bytesInFlight += p.size
 	r.lastAckElicit = p.sentAt
@@ -180,6 +230,7 @@ func (r *recovery) onAck(now time.Time, a wire.Ack, ackDelay, maxAckDelay time.D
 	if largestNew != nil {
 		r.rtt.update(now, now.Sub(largestNew.sentAt), min(ackDelay, maxAckDelay))
 	}
+	r.sampleRate(now, acked, largestNew)
 	// The window may only grow if the sender was actually using it.
 	limited := r.bytesInFlight+sumSize(acked) >= cwndBefore/2
 	for _, p := range acked {
@@ -189,6 +240,51 @@ func (r *recovery) onAck(now time.Time, a wire.Ack, ackDelay, maxAckDelay time.D
 	lost = r.detectLoss(now, maxAckDelay)
 	r.prune()
 	return acked, lost
+}
+
+// sampleRate updates the delivery counters and, if the controller wants
+// them, hands it a delivery-rate sample: bytes delivered between sending the
+// most recent acknowledged packet and now, over the longer of its send and
+// ack intervals (so neither ACK compression nor a sender burst inflates it).
+func (r *recovery) sampleRate(now time.Time, acked []*sentPacket, largestNew *sentPacket) {
+	var best *sentPacket
+	ackedBytes := 0
+	for _, p := range acked {
+		r.delivered += uint64(p.size)
+		ackedBytes += p.size
+		if best == nil || p.priorDelivered > best.priorDelivered ||
+			(p.priorDelivered == best.priorDelivered && p.sentAt.After(best.sentAt)) {
+			best = p
+		}
+	}
+	r.deliveredTime = now
+	if r.appLimited != 0 && r.delivered > r.appLimited {
+		r.appLimited = 0
+	}
+	s, ok := r.cc.(rateSampler)
+	if !ok || best == nil {
+		return
+	}
+	r.firstSentTime = best.sentAt
+	rs := rateSample{delivered: r.delivered, priorDelivered: best.priorDelivered, acked: ackedBytes,
+		inflight: r.bytesInFlight, appLimited: best.appLimited}
+	if largestNew != nil {
+		rs.rtt = now.Sub(largestNew.sentAt)
+	}
+	interval := max(best.sentAt.Sub(best.firstSentTime), now.Sub(best.priorDeliveredTime))
+	if interval > 0 && (!r.rtt.hasSample || interval >= r.rtt.minRTT) {
+		rs.rate = float64(r.delivered-best.priorDelivered) / interval.Seconds()
+	}
+	s.onRateSample(now, rs)
+}
+
+// markAppLimited records that the sender ran out of data with room in the
+// window, so rate samples taken until that data is delivered understate the
+// path and must not lower a bandwidth estimate.
+func (r *recovery) markAppLimited() {
+	if r.bytesInFlight < r.cc.Window() {
+		r.appLimited = max(r.delivered+uint64(r.bytesInFlight), 1)
+	}
 }
 
 func sumSize(ps []*sentPacket) int {
@@ -233,8 +329,15 @@ func (r *recovery) detectLoss(now time.Time, maxAckDelay time.Duration) []*sentP
 	}
 	if len(lost) > 0 {
 		r.lost += uint64(len(lost))
-		r.cc.OnLoss(now, lost[len(lost)-1].sentAt)
-		r.congestionEvents++
+		last := lost[len(lost)-1].sentAt
+		r.cc.OnLoss(now, last)
+		if lo, ok := r.cc.(lossObserver); ok {
+			lo.onPacketsLost(now, len(lost), sumSize(lost))
+		}
+		if r.recoveryStart.IsZero() || last.After(r.recoveryStart) {
+			r.congestionEvents++ // a new recovery period, not a loss within one
+			r.recoveryStart = now
+		}
 		if r.persistent(lost, maxAckDelay) {
 			r.cc.OnPersistentCongestion()
 		}

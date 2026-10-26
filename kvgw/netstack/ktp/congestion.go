@@ -184,8 +184,11 @@ func (c *cubic) OnPersistentCongestion() {
 }
 
 func newController(name string, mss int) CongestionController {
-	if name == "cubic" {
+	switch name {
+	case "cubic":
 		return newCubic(mss)
+	case "bbr":
+		return newBBR(mss)
 	}
 	return newNewReno(mss)
 }
@@ -202,15 +205,12 @@ type pacer struct {
 	capacity float64
 }
 
-func (p *pacer) rate(cwnd int, rtt *rttStats) float64 {
-	if !rtt.hasSample {
-		return 0 // unpaced until we know the RTT
-	}
-	s := rtt.smoothed.Seconds()
-	if s <= 0 {
+// defaultRate is 1.25 × cwnd / srtt, or 0 (unpaced) before an RTT sample.
+func defaultRate(cwnd int, rtt *rttStats) float64 {
+	if !rtt.hasSample || rtt.smoothed <= 0 {
 		return 0
 	}
-	return 1.25 * float64(cwnd) / s
+	return 1.25 * float64(cwnd) / rtt.smoothed.Seconds()
 }
 
 func (p *pacer) refill(now time.Time, rate float64, mss int) {
@@ -223,10 +223,10 @@ func (p *pacer) refill(now time.Time, rate float64, mss int) {
 	p.last = now
 }
 
-// allow reports whether size bytes may be sent at now, or when they may.
-func (p *pacer) allow(now time.Time, size, cwnd, mss int, rtt *rttStats) (bool, time.Time) {
-	r := p.rate(cwnd, rtt)
-	if r == 0 {
+// allow reports whether size bytes may be sent at now at the given rate
+// (bytes/s, 0 = unpaced), or when they may.
+func (p *pacer) allow(now time.Time, size int, r float64, mss int) (bool, time.Time) {
+	if r <= 0 {
 		return true, time.Time{}
 	}
 	p.refill(now, r, mss)

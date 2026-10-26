@@ -111,7 +111,7 @@ func (c *Conn) pollOneRTT(buf []byte, now time.Time, maxSize int) int {
 	canSend := probe
 	c.paceAt = time.Time{}
 	if !canSend && c.rec.bytesInFlight+maxSize <= cc.Window() {
-		ok, at := c.pace.allow(now, maxSize, cc.Window(), c.mss(), &c.rec.rtt)
+		ok, at := c.pace.allow(now, maxSize, c.pacingRate(), c.mss())
 		canSend = ok
 		if !ok && c.hasPendingWork() {
 			c.paceAt = at
@@ -171,6 +171,9 @@ func (c *Conn) pollOneRTT(buf []byte, now time.Time, maxSize int) int {
 		}
 	}
 	eliciting := len(frames) > 0
+	if canSend && !eliciting && !c.hasPendingWork() {
+		c.rec.markAppLimited()
+	}
 	if !eliciting {
 		if !ackIncluded || !c.acks.due(now, c.cfg.MaxAckDelay) {
 			return 0
@@ -264,6 +267,17 @@ func (c *Conn) nextStreamFrame(s *stream, left int) (wire.Stream, sentFrame, boo
 			sentFrame{kind: fkStream, streamID: s.id, offset: end, fin: true}, true
 	}
 	return wire.Stream{}, sentFrame{}, false
+}
+
+// pacingRate is the controller's own rate if it sets one (BBR), otherwise
+// 1.25 × cwnd / srtt.
+func (c *Conn) pacingRate() float64 {
+	if pc, ok := c.rec.cc.(pacingController); ok {
+		if r := pc.pacingRate(); r > 0 {
+			return r
+		}
+	}
+	return defaultRate(c.rec.cc.Window(), &c.rec.rtt)
 }
 
 func (c *Conn) hasPendingWork() bool {

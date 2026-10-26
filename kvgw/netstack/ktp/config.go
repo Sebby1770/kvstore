@@ -40,7 +40,8 @@ type Config struct {
 	MaxSendBuffer        int    // unacknowledged bytes buffered per stream (default 2 MiB)
 	MaxDatagramQueue     int    // queued datagrams each way (default 128)
 
-	// Congestion selects the controller: "newreno" (default) or "cubic".
+	// Congestion selects the controller: "newreno" (default), "cubic", or
+	// "bbr" (model-based; tolerates random loss).
 	Congestion string
 	// Rand supplies key material and connection IDs (default crypto/rand).
 	// Tests pass a seeded reader to make whole connections reproducible.
@@ -100,7 +101,7 @@ func (c *Config) resolved() (*Config, error) {
 	switch r.Congestion {
 	case "":
 		r.Congestion = "newreno"
-	case "newreno", "cubic":
+	case "newreno", "cubic", "bbr":
 	default:
 		return nil, fmt.Errorf("%w: unknown congestion controller %q", ErrConfig, r.Congestion)
 	}
