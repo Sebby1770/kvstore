@@ -40,6 +40,6 @@
 // goroutines take turns) the same seed reproduces the same losses, delays and
 // corruptions. Link.Fate is the pure fault model on its own — given an RNG and
 // a packet size it returns the delays of the copies that survive — so the
-// discrete-event simulator in runtime/sim applies exactly the same faults
+// discrete-event harness in the KTP tests applies exactly the same faults
 // without goroutines or timers.
 package simnet

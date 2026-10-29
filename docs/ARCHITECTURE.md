@@ -14,14 +14,13 @@ Go tier into two reusable layers and rebuilds the store on top of them:
    │   raft     consensus (sans-IO): pre-vote, check-quorum, ReadIndex, snapshots, conf changes       │
    │   swim     membership + failure detection (sans-IO): suspicion, incarnations, Lifeguard, gossip   │
    │   hlc      hybrid logical clocks                                                                │
-   │   sim      deterministic simulation: virtual time, seeded faults, invariant checkers             │
    ├───────────────────────────────────────────────────────────────────────────────────────────────┤
    │ netstack/ — networking stack                                                                   │
    │   rpc      unary + server-streaming RPC over KTP streams: deadlines, cancellation, status codes  │
    │   endpoint goroutine driver: one UDP socket, many connections, Dial/Accept, net.Conn-like streams │
    │   ktp      KTP, the transport protocol (sans-IO): 1-RTT mutually-authenticated handshake,         │
    │            AEAD packets, multiplexed streams, flow control, ACK ranges, RFC 9002 loss recovery,   │
-   │            NewReno + CUBIC congestion control, pacing, datagrams, keep-alive, close/drain          │
+   │            NewReno / CUBIC / BBR congestion control, pacing, datagrams, keep-alive, close/drain   │
    │   wire     packet + frame codec, varints, CRC32C                                                │
    │   simnet   in-memory packet network: latency, jitter, loss, dup, reorder, corrupt, partitions    │
    └───────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -149,8 +148,13 @@ adjusted.
 
 **Congestion control.** Pluggable `CongestionController`; NewReno (slow start,
 congestion avoidance, one reduction per recovery period, persistent congestion
-collapses to the minimum window) and CUBIC (RFC 9438, with Reno-friendly
-region). A token-bucket pacer spreads a window over the RTT.
+collapses to the minimum window), CUBIC (RFC 9438, with Reno-friendly region),
+and BBR v1 with BBRv2's loss-based Startup exit. BBR is fed per-ACK
+delivery-rate samples (draft-cheng-iccrg-delivery-rate-estimation, with
+application-limited marking) and sets its own pacing rate; it was added after a
+benchmark showed the loss-based controllers collapsing to ~1.7 Mbit/s at 2%
+random loss on a 160 Mbit/s link (BBR: ~120 Mbit/s). A token-bucket pacer
+spreads a window over the RTT at the controller's rate or 1.25 × cwnd / srtt.
 
 **Lifecycle.** Keep-alive PINGs, idle timeout, CONNECTION_CLOSE with a
 draining period of 3 × PTO, stateless Reset for unknown connection IDs.
@@ -167,7 +171,7 @@ Bandwidth, MTU}` (with a default link and `"*"` wildcards), partitions
 (`Partition(groups...)`, `Heal`, `Block(from,to)`, `Isolate(addr)`), bounded
 receive queues (drop when full, like a socket buffer), seeded RNG, and delivery
 via `time.AfterFunc` so it runs under `testing/synctest`. `Link.Fate(rng, size)`
-is the pure fault model, reused by `runtime/sim`.
+is the pure fault model, reused by the KTP test harness.
 
 ## netstack/endpoint
 
@@ -184,8 +188,13 @@ drive `HandleTimeout`. Public surface:
 * `Stream`: `Read`, `Write`, `Close` (half-close: sends FIN), `CancelRead`,
   `Reset`, deadlines — usable as an `io.ReadWriteCloser` / mostly `net.Conn`.
 
-`Dial` reuses an established connection to the same address when asked
-(`Endpoint.Conn(ctx, addr)`), so higher layers share one connection per peer.
+`Endpoint.Conn(ctx, addr)` returns an established connection to an address --
+one we dialed or one the peer dialed to us (accepted connections are
+registered under the peer's address) -- dialing only if there is none, with
+concurrent callers sharing a single dial. Peer-to-peer users set
+`Options.AcceptDialed` so their accept loop also serves connections they
+dialed: either side may then open streams on either connection, and each pair
+of mesh nodes shares one encrypted connection.
 
 ## netstack/rpc
 
@@ -307,18 +316,41 @@ datagrams, Raft + control plane over RPC, an actor host, and the KV gateway
 any request — no single gateway — and the HTTP API adds `/mesh/*`, `/lease/*`,
 `/jobs/*`, `/actor/*` next to the 1.x KV routes.
 
-## runtime/sim — deterministic simulation
+## Deterministic simulation (where it lives)
 
-A discrete-event simulator: virtual clock, priority queue of events, seeded RNG,
-the simnet fault model, crash/restart with durable storage, partitions. It runs
-real `raft`, `control`, `swim`, and `ktp` cores and checks invariants on every
-step:
+The plan was a separate `runtime/sim` package; in the end each sans-IO core
+carries its own seeded, virtual-time simulator next to its tests, which keeps
+every harness in the package whose invariants it checks:
 
-* Raft: election safety, log matching, leader completeness, state machine safety.
-* Control: lease mutual exclusion, strictly increasing fencing tokens, job
-  exactly-once completion per token.
-* SWIM: after healing, every live node converges to the same live set; crashed
-  nodes are declared dead everywhere.
-* KTP: byte-exact delivery under loss/dup/reorder/corruption; no deadlock.
+* `runtime/raft` -- a 5-node cluster with drop / duplicate / reorder,
+  partitions and crash-restart from durable storage, checking election safety,
+  log matching, leader completeness, state-machine safety and commit
+  monotonicity after every Ready (120 seeds in the full run).
+* `runtime/swim` -- clusters of up to 32 nodes: convergence, crash detection
+  without false positives, refutation, rejoin, partitions healing, long lossy
+  runs; the same seed reproduces the same event trace.
+* `netstack/ktp` -- a client/server pair over the simnet fault model
+  (`Link.Fate`) with bandwidth queues: byte-exact delivery under loss, dup,
+  reorder and corruption for every congestion controller.
+* `runtime/control` -- model-based lease checks; determinism and
+  snapshot-equivalence over random command logs.
 
-Failures print the seed; `go test ./runtime/sim -run TestX -seed N` replays it.
+Drivers are tested on top: `netstack/endpoint`, `netstack/rpc`,
+`runtime/control` (Service), `runtime/actor` and `runtime/node` run inside
+`testing/synctest` bubbles over `simnet`, so whole meshes -- gossip, Raft,
+actors, KV -- run on virtual time and a 40-second failover test takes well
+under a second. Failures print their seed; the `make chaos` target runs the
+full-size suites and CI runs them on every push.
+
+## What changed from this plan
+
+* Actor state lives in the control plane's registry (linearizable CAS) rather
+  than the KV data plane: the data plane's CAS is per-coordinator, which is not
+  a safe fence once there are many coordinators. Values are therefore bounded by
+  the registry limit (64 KiB), and every persist is a Raft commit.
+* Actor placement uses SWIM's *alive* members only (not suspects), so actors
+  fail over as soon as their host is suspected; a false suspicion costs a brief
+  double activation that the CAS fence makes harmless.
+* Raft writes the founding membership into the log as committed conf-change
+  entries (identical on every founder), so a node added later learns the full
+  membership by replication instead of believing it is alone.
