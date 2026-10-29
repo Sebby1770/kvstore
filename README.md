@@ -1,57 +1,77 @@
 # KVStore
 
-A small **replicated, fault-tolerant** key-value store written in **C, Rust, and
-Go** — each language in the layer it actually fits.
+A **distributed systems runtime and networking stack**, written from scratch,
+with a replicated key-value store as its first application. **C, Rust and Go**,
+each in the layer it fits; the Go tier is standard library only.
+
+KVStore 1.x was a quorum-replicated KV store behind a single gateway. 2.0 turns
+that gateway into a mesh: every node runs its own encrypted transport protocol,
+gossip membership, a Raft control plane, a virtual-actor runtime and a KV
+coordinator, and any node serves any request.
 
 ```
-   ┌────────────────────────────────────────────────────────┐
-   │  kvstore  (Go CLI / HTTP)                              │
-   └───────────────────────────┬────────────────────────────┘
-                               │ HTTP
-   ┌───────────────────────────▼────────────────────────────┐
-   │  gateway (Go) — rendezvous ring + quorum coordinator    │
-   │  key -> top-RF replicas;  W acks to write,  R to read;  │
-   │  last-writer-wins by version;  read-repair;  hinted      │
-   │  handoff;  heartbeat failure detection;  native TTL      │
-   └──┬──────────────┬──────────────┬──────────────┬─────────┘
-      │ TCP          │ TCP          │ TCP          │ TCP
-   ┌──▼─────┐    ┌───▼────┐     ┌───▼────┐     ┌───▼────┐
-   │ kvnode │    │ kvnode │     │ kvnode │     │ kvnode │   (Rust, one per node)
-   └──┬─────┘    └───┬────┘     └───┬────┘     └───┬────┘
-      │ FFI          │ FFI          │ FFI          │ FFI
-   ┌──▼──────────────────────────────────────────────────────┐
-   │  libkvengine.a (C) — mmap'd open-addressed hash table,   │
-   │  versioned slots, native expires_at, rehash/GC, CRC      │
-   └──────────────────────────────────────────────────────────┘
+                       HTTP: KV API · /mesh · /lease · /jobs · /actor · /registry
+   ┌──────────────────────────────────────────────────────────────────────────────┐
+   │ kvmesh node (Go) ×N — every node is a full peer                              │
+   │                                                                              │
+   │  runtime/   KV coordinator ◄─ ring ── control plane (Raft FSM: ring, leases   │
+   │                                        + fencing tokens, job queues, registry)│
+   │             virtual actors ◄─ placement ── SWIM membership (Lifeguard)        │
+   │             hybrid logical clocks · HLC-ordered event log                     │
+   │                                                                              │
+   │  netstack/  rpc (calls over streams) · endpoint (one UDP socket)              │
+   │             KTP: 1-RTT X25519/Ed25519 handshake, AES-GCM, multiplexed         │
+   │             streams, flow control, RFC 9002 recovery, NewReno/CUBIC/BBR       │
+   └───────┬──────────────────────────┬──────────────────────────┬────────────────┘
+           │ KTP/UDP between kvmesh nodes (gossip, Raft, actor calls)   ▲
+           │ TCP to storage nodes                                       │ SWIM
+   ┌───────▼─────┐   ┌─────────────┐   ┌─────────────┐
+   │ kvnode      │   │ kvnode      │   │ kvnode      │   Rust daemon, one per disk
+   │  └ FFI      │   │  └ FFI      │   │  └ FFI      │
+   │ libkvengine │   │ libkvengine │   │ libkvengine │   C: mmap'd hash table, versioned slots
+   └─────────────┘   └─────────────┘   └─────────────┘
 ```
 
-- **C** owns the storage engine — a memory-mapped, open-addressed hash table
-  (FNV-1a + linear probing). Every slot carries a **version** and optional
-  **expires_at**. Writes are **last-writer-wins** and idempotent, deletes are
-  **versioned tombstones**, expired keys are lazily tombstoned, **rehash**
-  drops tombstones (GC) and auto-grows past ~70% load, **compact** rehashes at
-  the same capacity (GC without grow), **prefix scan** visits live keys by
-  `memcmp` on a key prefix, and the header carries a **CRC32** so a torn page
-  is caught on open.
-- **Rust** owns the node daemon — a TCP server speaking a length-prefixed binary
-  protocol, calling into the C engine over FFI. It's deliberately dumb: it stores
-  whatever version and expiry it's told and reports them back. All distributed
-  policy lives above it.
-- **Go** owns the gateway and CLI — a **rendezvous-hashing ring**, a **quorum
-  coordinator** (replication, read/write quorums, read-repair, hinted handoff,
-  heartbeat), an HTTP front door, and `kvstore`.
+![The mesh control room](docs/mesh-control-room.jpg)
+
+**What you get**
+
+- **KTP**, a QUIC-style transport over UDP (`netstack/ktp`): one-round-trip
+  mutually authenticated handshake bound to a cluster key, AEAD-sealed packets,
+  multiplexed streams and datagrams, credit flow control, ACK ranges and
+  RFC 9002 loss recovery, and three congestion controllers — NewReno, CUBIC and
+  **BBR** (moves data ~8× faster than NewReno at 2% random loss).
+- **SWIM** membership with Lifeguard (`runtime/swim`): suspicion, incarnations,
+  refutation, piggybacked gossip, push-pull, partition healing.
+- **Raft** (`runtime/raft`): pre-vote, check-quorum, ReadIndex, snapshots,
+  membership changes, leadership transfer, a CRC-framed WAL — checked against
+  Raft's safety invariants under 120 seeds of partitions and crashes.
+- A **control plane** on Raft (`runtime/control`): the one storage ring every
+  coordinator serves, **leases with fencing tokens**, **job queues** with
+  visibility timeouts and token-fenced completion, a linearizable registry.
+- **Virtual actors** (`runtime/actor`): activated on demand on their owner,
+  turn-based, migrating with their state when nodes die, fenced by CAS.
+- The **KV store** from 1.x, now served by every node, with its ring adopted
+  from the control plane — plus the 1.x single-gateway mode, unchanged.
+
+The design contract is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); every
+package's `doc.go` explains its protocol.
 
 ## Build
 
-Requires `cc` (clang or gcc), `cargo` (Rust 1.70+), and `go` (1.22+).
+Requires `cc` (clang or gcc), `cargo` (Rust 1.70+), and `go` (1.25+).
 
 ```sh
-make all          # builds C lib, Rust node, Go gateway + CLI -> bin/
-make test         # C engine smoke + cargo test + go test + go vet
-make demo         # spins up a cluster and proves fault tolerance
+make all          # C lib, Rust node, Go gateway/kvmesh/ktpcat + CLI -> bin/
+make test         # C engine + cargo test + go test -short + go vet + JS client
+make test-race    # runtime + networking stack under the race detector
+make chaos        # the seeded fault-injection suites at full size
+make fuzz-smoke   # every Fuzz target for a few seconds (FUZZTIME=10s)
+make mesh-demo    # 3 storage nodes + 3 kvmesh nodes on UDP; kill -9 the leader
+make demo         # the 1.x single-gateway demo
 ```
 
-## Demo
+## Single-gateway demo (1.x)
 
 `make demo` starts four nodes and a gateway (`RF=3, R=2, W=2`), then **kills a
 replica mid-flight** and shows reads and writes still succeed (a hint is stored
@@ -73,7 +93,137 @@ X-KV-Repaired: 127.0.0.1:7071
 X-KV-Version: 5
 ```
 
-## Use it manually
+## Mesh demo
+
+`make mesh-demo` (or `scripts/mesh-demo.sh`) starts three storage nodes and
+three `kvmesh` nodes on real UDP sockets, then a fourth. Output from a real run:
+
+```
+== mesh tier: 3 kvmesh nodes bootstrapping a Raft control plane over KTP/UDP
+   members: n1=alive, n2=alive, n3=alive
+   raft: leader n1, term 2, voters n1,n2,n3
+   storage ring (from the control plane): epoch 1 127.0.0.1:7170,127.0.0.1:7171,127.0.0.1:7172
+== KV: write through n1, read through n3 (no single gateway)
+   PUT /kv/hello via n1 -> 204
+   GET /kv/hello via n3 -> world
+== leases with fencing tokens (Raft-replicated)
+   alice: token 6 (holder alice)
+   bob:   HTTP 409 (conflict)
+== virtual actor: one counter, asked through every node
+   via n1: counter=1  (activated on n3)  ...  via n1: counter=4  (activated on n3)
+== fault: kill -9 the actor's owner (n3) and the control-plane leader (n1)
+   control plane: re-elected, leader n2 (term 3)
+   counter=5 (re-activated on n1) after 8s
+   SWIM on n2: n1=alive, n2=alive, n3=dead
+   GET /kv/hello via n2 -> world
+   bob still cannot take alice's lease after failover: HTTP 409
+== elastic: n4 joins via gossip, is added as a Raft learner, then promoted
+   voters: n1,n2,n3,n4  learners: -
+```
+
+## Running a mesh
+
+```sh
+# storage nodes (as in 1.x)
+for i in 0 1 2; do bin/kvnode --listen 127.0.0.1:707$i --db /tmp/kv$i.db & done
+
+# three founding kvmesh nodes; every founder gets the same --bootstrap list
+BOOT=n1=127.0.0.1:7101,n2=127.0.0.1:7102,n3=127.0.0.1:7103
+for i in 1 2 3; do
+  bin/kvmesh --name n$i --listen 127.0.0.1:710$i --http 127.0.0.1:810$i \
+    --data /tmp/mesh-n$i --cluster-key s3cret --bootstrap $BOOT \
+    --kvnodes 127.0.0.1:7070,127.0.0.1:7071,127.0.0.1:7072 &
+done
+
+# later: a node joins through any member; it becomes a learner, then a voter
+bin/kvmesh --name n4 --listen 127.0.0.1:7104 --http 127.0.0.1:8104 \
+  --data /tmp/mesh-n4 --cluster-key s3cret --join 127.0.0.1:7101 &
+
+open http://127.0.0.1:8101/mesh      # mesh control room (KV dashboard at /dashboard)
+```
+
+Every node serves the full 1.x KV API plus:
+
+| route | what |
+|---|---|
+| `GET /mesh/status` | members, Raft, ring, leases, queues, KTP connections, actors, RPC stats, event log |
+| `GET /mesh/metrics` | Prometheus gauges: members, term, commit, leader, ring epoch, per-peer RTT/cwnd/loss |
+| `POST /mesh/raft/transfer?to=` | hand control-plane leadership to a node |
+| `POST /lease/{name}?holder=&ttl=` | acquire (`&renew=1&token=` to renew); returns the fencing token |
+| `DELETE /lease/{name}?holder=&token=` · `GET /leases` | release · list (linearizable) |
+| `POST /jobs/{q}` (body = payload, `?id=` for idempotency) | enqueue |
+| `POST /jobs/{q}/claim?worker=&visibility=30s` | claim the oldest ready job: `{id, payload, token, attempt}` |
+| `POST /jobs/{q}/{id}/complete\|fail\|extend?token=` | finish, retry with backoff (dead-letter after max attempts), or extend |
+| `GET\|PUT /registry/{key}` | linearizable metadata (`If-Match` for CAS) |
+| `POST /actor/{type}/{key}` (body = message) | ask a virtual actor (`counter`: `inc N`/`get`; `ledger`: append) |
+| `POST /admin/nodes?addr=` · `DELETE /admin/nodes/{addr}` | change the storage ring — through Raft, so every node adopts it |
+
+And the CLI speaks it: `kvstore --gw http://127.0.0.1:8101 mesh`, `lease acquire
+primary alice 30s`, `jobs claim emails w1`, `actor counter visits inc`.
+
+**Why the ring lives in Raft.** In 1.x each gateway kept its own node list. Two
+gateways with different lists pick different replica sets, so a write quorum on
+one and a read quorum on the other need not overlap — `R + W > RF` silently
+stops meaning anything. In 2.0 the ring is a Raft-replicated value with an epoch
+(changes are compare-and-set on the epoch), and coordinators only ever move
+forward to newer epochs.
+
+## The networking stack: KTP
+
+`ktpcat` is netcat and a benchmark for KTP, including an in-process mode over a
+simulated link that traces the congestion controller as it runs:
+
+```sh
+bin/ktpcat -l 127.0.0.1:9000 &                      # server
+bin/ktpcat -bench 64MiB 127.0.0.1:9000              # goodput, RTT, cwnd, loss
+bin/ktpcat -sim -loss 0.02 -latency 20ms -bw 20MB -bench 64MiB -cc bbr
+```
+
+Measured with `-sim` on a 20 MB/s (160 Mbit/s) link, 40ms RTT, 256 KB router queue:
+
+| | clean link | 2% random loss |
+|---|---|---|
+| NewReno | 103 Mbit/s | 1.8 Mbit/s |
+| CUBIC | 130 Mbit/s | 1.7 Mbit/s |
+| BBR | 143 Mbit/s | 122 Mbit/s |
+
+Loss-based controllers read every random drop as congestion and halve their
+window (the Mathis bound, ≈ 1.22·MSS / (RTT·√p)); BBR models the path from
+delivery-rate samples and ignores loss that isn't caused by its own queue. KTP
+keeps NewReno as the library default (it is the RFC baseline), `kvmesh` uses
+CUBIC (`--cc` changes it), and `ktpcat` defaults to BBR.
+
+Wire format, handshake and recovery are documented in
+[`kvgw/netstack/ktp/doc.go`](kvgw/netstack/ktp/doc.go).
+
+## Testing the hard parts
+
+Every protocol core is a **sans-IO state machine** — no sockets, clocks or
+goroutines; time and randomness are parameters — so the tests drive whole
+clusters deterministically from a seed and replay failures exactly:
+
+- **Raft**: a simulated 5-node cluster with message loss, duplication,
+  reordering, partitions and crash/restart from durable storage, checking
+  election safety, log matching, leader completeness, state-machine safety and
+  commit monotonicity after every step: 120 seeds, ~800 elections, ~70,000
+  acknowledged proposals, all converged and none lost.
+- **SWIM**: 5–32 node clusters converge; crashes are detected everywhere with
+  no false positives; 10 minutes at 10% loss with zero false deaths; partitions
+  heal; same seed, same event trace.
+- **KTP**: byte-exact 8-stream transfers at 0/1/5/20% loss with duplication,
+  reordering and bit flips, for every congestion controller; RTT and congestion
+  maths checked against the RFCs.
+- **Control plane**: model-based lease exclusion and fencing; replicas fed the
+  same log end byte-identical; snapshot-at-a-random-point equivalence.
+- **Actors**: turn-based execution under 200 concurrent callers; split brain
+  (two nodes both owning an actor) loses no acknowledged update.
+- **Full stack**: whole meshes on `simnet` inside `testing/synctest` (virtual
+  time): crash the actor's host and the Raft leader, check failover.
+- **Fuzzing**: every network-facing decoder (KTP packets and frames behind
+  authentication, Raft messages, SWIM gossip, RPC frames, control commands).
+  Fuzzing found two real Raft crashes on malformed messages, now validated away.
+
+## Use it manually (single gateway, 1.x)
 
 ```sh
 # 4 storage nodes
@@ -329,7 +479,7 @@ open http://127.0.0.1:8090/dashboard
 
 Counters are also at `GET /metrics` in Prometheus text format.
 
-## Proving it (not just demoing it)
+## Proving the KV layer
 
 `internal/cluster/cluster_sim_test.go` is a small deterministic simulation /
 linearizability checker. For each of 25 seeds it drives the **real coordinator**
@@ -350,7 +500,7 @@ was lost.
 And the *protocol* itself is model-checked: [`spec/QuorumKV.tla`](spec/QuorumKV.tla)
 is a TLA+ model of KVStore's R + W > N safety property, verified with TLC.
 
-## Wire protocol
+## Storage wire protocol (coordinator ↔ kvnode)
 
 Length-prefixed binary, big-endian, designed to be readable in `tcpdump -X`.
 Values carry an 8-byte version and an 8-byte `expires_at` (0 = never).
@@ -389,12 +539,25 @@ prefix (`memcmp`; empty prefix = full scan). Inserts that would return
 
 ## What it still is not
 
-- **Not highly available end-to-end** — the gateway is a single process. You can
-  run several behind a load balancer; they share no state, and the read-before-write
-  version peek keeps versions monotonic across them.
-- **Membership is still gateway-driven** — heartbeat detects unreachability for
-  write-skipping and hint replay, but it does not auto-eject nodes. Join/leave
-  goes through `/admin/nodes`.
+- **The storage tier speaks plain TCP.** Links between kvmesh nodes are KTP
+  (encrypted, authenticated); links from a coordinator to its kvnodes are still
+  the 1.x binary protocol, unencrypted and unauthenticated. Keep kvnodes on
+  localhost or a private network. Moving kvnode onto KTP is the obvious next step.
+- **The HTTP API has no authentication** (as in 1.x): anyone who can reach a
+  node's HTTP port can write keys, take leases, change the ring or transfer
+  Raft leadership. Bind `--http` to localhost or a private network, or put it
+  behind an authenticating proxy. (The mesh port is protected: peers without
+  the cluster key cannot complete a KTP handshake or forge gossip.)
+- **KV writes are last-writer-wins.** Versions come from a quorum peek plus a
+  Lamport clock; concurrent writers on different coordinators are ordered
+  deterministically, not by real time. Use CAS, CRDTs, or a lease with its
+  fencing token when that matters.
+- **Actor single-activation is about state, not execution.** During membership
+  churn two nodes can briefly run the same actor; the CAS fence guarantees no
+  acknowledged state update is lost, but side effects outside actor state are
+  not fenced.
+- **Membership changes are single-server** (one voter or learner at a time), and
+  the control plane is sized for metadata, not bulk data.
 - Fixed-size slots and `MS_SYNC` per write are honest, not fast.
 
 ## JS client
@@ -412,19 +575,31 @@ await kv.put('hello', 'world');
 ## Layout
 
 ```
-kvengine/           C — storage engine (libkvengine.a), v3 + CRC + TTL + rehash
-kvnode/             Rust — TCP server + FFI
-kvgw/
-  internal/kv       shared value types + Node interface
-  internal/ring     rendezvous hashing (+ tests)
-  internal/cluster  quorum coordinator: replication, repair, CAS, TTL, hints
-  internal/client   TCP client implementing kv.Node
-  internal/proto    wire codec
-  cmd/gateway       HTTP front door + dashboard
-  cmd/kvstore       CLI
-clients/            tiny JS HTTP client (no deps)
-docker-compose.yml  4 kvnodes + gateway on :8090
-scripts/            demo.sh
+kvengine/             C — storage engine (libkvengine.a), v3 + CRC + TTL + rehash
+kvnode/               Rust — TCP server + FFI
+kvgw/                 Go module (standard library only)
+  netstack/wire       KTP packet + frame codec, varints, CRC32C
+  netstack/ktp        KTP transport (sans-IO): handshake, streams, recovery, NewReno/CUBIC/BBR
+  netstack/simnet     in-memory lossy packet network for tests (synctest-friendly)
+  netstack/endpoint   KTP over a UDP socket: dial/accept, streams, raw datagrams, resets
+  netstack/rpc        unary + streaming RPC over KTP streams
+  runtime/hlc         hybrid logical clocks
+  runtime/swim        SWIM + Lifeguard membership (sans-IO)
+  runtime/raft        Raft (sans-IO) + file storage
+  runtime/control     replicated control-plane FSM + the Service that runs it on Raft
+  runtime/actor       virtual actors
+  runtime/node        the kvmesh daemon: every layer wired together, HTTP routes, control room
+  internal/cluster    quorum coordinator: replication, repair, CAS, TTL, hints, epochs
+  internal/httpapi    the KV HTTP API + dashboard (shared by gateway and kvmesh)
+  internal/{kv,ring,client,proto,crdt}
+  cmd/kvmesh          mesh node daemon
+  cmd/ktpcat          KTP netcat / benchmark / simulator
+  cmd/gateway         1.x single-process gateway
+  cmd/kvstore         CLI
+clients/              tiny JS HTTP client (no deps)
+docs/                 ARCHITECTURE.md, screenshots
+scripts/              demo.sh (1.x), mesh-demo.sh (2.0)
+spec/                 TLA+ model of the quorum protocol
 ```
 
 ## Changelog

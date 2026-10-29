@@ -1,4 +1,4 @@
-package main
+package httpapi
 
 // dashboardHTML is a self-contained control room served at GET /dashboard.
 // No build step, no dependencies — polls the gateway's own JSON endpoints.
@@ -104,6 +104,7 @@ const dashboardHTML = `<!doctype html>
   <header class="brand">
     <h1>KVStore</h1>
     <span class="tag">control room · C engine · Rust nodes · Go coordinator</span>
+    <span class="tag" id="meshlink" style="margin-left:auto"></span>
   </header>
   <div class="top">
     <span id="cfg">loading…</span>
@@ -617,6 +618,10 @@ const dashboardHTML = `<!doctype html>
   el('sadd').addEventListener('click',function(){sdo('add');});
   el('srm').addEventListener('click',function(){sdo('rm');});
   el('sread').addEventListener('click',function(){sdo('read');});
+  // Served by a kvmesh node? Link to its mesh control room.
+  fetch('/mesh/status').then(function(r){
+    if(r.ok) el('meshlink').innerHTML='<a href="/mesh" style="color:#7cc7e8">mesh control room →</a>';
+  }).catch(function(){});
   refresh();setInterval(refresh,1500);
 })();
 </script>
