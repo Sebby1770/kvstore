@@ -48,6 +48,7 @@ func main() {
 	ae := flag.Duration("anti-entropy", 0, "KV repair sweep interval (0 = off)")
 	key := flag.String("cluster-key", os.Getenv("KVMESH_CLUSTER_KEY"), "cluster secret (or $KVMESH_CLUSTER_KEY)")
 	insecure := flag.Bool("insecure", false, "KTP without encryption (debugging only)")
+	cc := flag.String("cc", "cubic", "KTP congestion controller: cubic, bbr or newreno")
 	maxVoters := flag.Int("max-voters", 5, "promote joining nodes to voters up to this many")
 	quiet := flag.Bool("quiet", false, "less logging")
 	flag.Parse()
@@ -64,7 +65,7 @@ func main() {
 	}
 	n, err := node.Start(node.Config{
 		Name: *name, Listen: *listen, Advertise: *advertise, HTTP: *httpAddr, DataDir: *data,
-		ClusterKey: []byte(*key), Insecure: *insecure, Bootstrap: splitList(*bootstrap), Join: splitList(*join),
+		ClusterKey: []byte(*key), Insecure: *insecure, Congestion: *cc, Bootstrap: splitList(*bootstrap), Join: splitList(*join),
 		MaxVoters: *maxVoters, KVNodes: splitList(*kvnodes), RF: *rf, R: *rq, W: *wq,
 		Heartbeat: *hb, AntiEntropy: *ae, Logf: logf,
 	})

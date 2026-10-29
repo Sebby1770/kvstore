@@ -47,6 +47,11 @@ type Options struct {
 	MaxConns int
 	// ResetRate bounds stateless resets sent per second (100).
 	ResetRate int
+	// AcceptDialed also hands connections this endpoint dialed to Accept.
+	// Peer-to-peer users (RPC servers that also make calls) set it: since
+	// Conn may reuse a connection the peer opened, either side can open
+	// streams on either connection, so both must be served.
+	AcceptDialed bool
 }
 
 // Errors.
@@ -333,6 +338,15 @@ func (e *Endpoint) flushLocked(c *Conn) {
 		case ktp.EventConnected:
 			c.markReady()
 			if !c.kc.IsClient() {
+				// A peer that dialed us is as reachable over this
+				// connection as over one we dial: register it so
+				// Conn(ctx, addr) reuses it instead of opening a second
+				// connection between the same two nodes.
+				if old := e.byAddr[c.addrStr]; old == nil || !old.kc.Established() {
+					e.byAddr[c.addrStr] = c
+				}
+			}
+			if !c.kc.IsClient() || e.opts.AcceptDialed {
 				select {
 				case e.acceptCh <- c:
 					e.stats.Accepted++

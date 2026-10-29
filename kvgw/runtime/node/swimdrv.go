@@ -12,7 +12,7 @@ import (
 )
 
 // memberView is the node's picture of the live mesh, fed by SWIM. It is also
-// the actor Placement: rendezvous hashing over live members, the same
+// the actor Placement: rendezvous hashing over alive members, the same
 // algorithm the KV ring uses, so an actor moves only when its owner leaves
 // or a new member out-scores it.
 type memberView struct {
@@ -33,7 +33,12 @@ func (v *memberView) set(ms []swim.Member) {
 	var live []string
 	for _, m := range ms {
 		v.all[m.Name] = m
-		if m.State == swim.StateAlive || m.State == swim.StateSuspect {
+		// Suspects are excluded from placement. SWIM keeps a suspect in the
+		// membership until the suspicion times out (seconds), but an actor
+		// whose owner is probably dead should fail over now; if the
+		// suspicion was false, the CAS fence makes the brief double
+		// activation harmless and the actor moves back.
+		if m.State == swim.StateAlive {
 			live = append(live, m.Name)
 		}
 	}

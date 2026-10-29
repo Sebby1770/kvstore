@@ -349,6 +349,14 @@ type MeshStatus struct {
 
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
+// list keeps empty lists as [] rather than null in JSON.
+func list(xs []string) []string {
+	if xs == nil {
+		return []string{}
+	}
+	return xs
+}
+
 // Status snapshots the node for the dashboard and operators.
 func (n *Node) Status() MeshStatus {
 	members := n.swim.members()
@@ -393,11 +401,11 @@ func (n *Node) Status() MeshStatus {
 	return MeshStatus{
 		Node: map[string]any{"name": n.cfg.Name, "addr": n.cfg.Advertise, "http": n.cfg.HTTPAdvertise,
 			"identity": Fingerprint(n.identity.Public().(ed25519.PublicKey)), "hlc": n.clock.Now().String()},
-		Members: members,
+		Members: append([]swim.Member{}, members...),
 		Health:  n.swim.localHealth(),
 		Raft: map[string]any{"id": st.ID, "term": st.Term, "leader": st.Lead, "role": st.Role.String(),
-			"commit": st.Commit, "applied": st.Applied, "last_index": st.LastIndex, "voters": st.Voters,
-			"learners": st.Learners, "progress": progress},
+			"commit": st.Commit, "applied": st.Applied, "last_index": st.LastIndex, "voters": list(st.Voters),
+			"learners": list(st.Learners), "progress": progress},
 		Control: map[string]any{"ring": fsm.Ring(), "leases": len(leaseList), "lease_list": leaseList,
 			"queues": queues, "registry_keys": len(fsm.Keys(""))},
 		Transport: tr,

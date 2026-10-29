@@ -67,8 +67,10 @@ func (m *memKV) scan(all bool) []kv.Entry {
 }
 func (m *memKV) Scan() ([]kv.Entry, error)    { return m.scan(false), nil }
 func (m *memKV) ScanAll() ([]kv.Entry, error) { return m.scan(true), nil }
-func (m *memKV) Stat() (kv.Stat, error)       { return kv.Stat{Capacity: 1024, Count: uint32(len(m.scan(false)))}, nil }
-func (m *memKV) Compact() error               { return nil }
+func (m *memKV) Stat() (kv.Stat, error) {
+	return kv.Stat{Capacity: 1024, Count: uint32(len(m.scan(false)))}, nil
+}
+func (m *memKV) Compact() error { return nil }
 
 type mesh struct {
 	t     *testing.T

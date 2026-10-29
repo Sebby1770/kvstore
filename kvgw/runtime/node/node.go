@@ -54,7 +54,8 @@ type Config struct {
 	DataDir       string // identity key + Raft WAL ("" = ephemeral, in memory)
 
 	ClusterKey []byte
-	Insecure   bool // KTP without AEAD (debugging only)
+	Insecure   bool   // KTP without AEAD (debugging only)
+	Congestion string // KTP congestion controller: bbr, cubic, newreno [cubic]
 
 	// Bootstrap lists the founding control-plane voters as "name=addr".
 	// Every founding node must be started with the same list. Nodes not in
@@ -129,6 +130,9 @@ func (c *Config) defaults() error {
 	}
 	if c.HTTPAdvertise == "" {
 		c.HTTPAdvertise = c.HTTP
+	}
+	if c.Congestion == "" {
+		c.Congestion = "cubic"
 	}
 	if c.MaxVoters <= 0 {
 		c.MaxVoters = 5
@@ -211,9 +215,9 @@ func Start(cfg Config) (*Node, error) {
 	}
 
 	// Transport.
-	kcfg := &ktp.Config{Identity: n.identity, ClusterKey: cfg.ClusterKey, Insecure: cfg.Insecure,
+	kcfg := &ktp.Config{Identity: n.identity, ClusterKey: cfg.ClusterKey, Insecure: cfg.Insecure, Congestion: cfg.Congestion,
 		KeepAlive: 5 * time.Second, IdleTimeout: 30 * time.Second, HandshakeTimeout: 3 * time.Second}
-	eopts := endpoint.Options{Resolve: cfg.Resolve, Logf: n.logf}
+	eopts := endpoint.Options{Resolve: cfg.Resolve, Logf: n.logf, AcceptDialed: true}
 	if cfg.PacketConn != nil {
 		n.ep, err = endpoint.New(cfg.PacketConn, kcfg, eopts)
 	} else {
