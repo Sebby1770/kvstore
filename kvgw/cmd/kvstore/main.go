@@ -16,6 +16,13 @@
 //	kvstore rm-prefix PREFIX
 //	kvstore fault   ADDR on|off
 //	kvstore bench   [N]
+//
+// Against a kvmesh node (any node of the mesh):
+//
+//	kvstore mesh                                  status: members, raft, ring, transport
+//	kvstore lease acquire|renew|release|list ...  leases with fencing tokens
+//	kvstore jobs enqueue|claim|complete|fail|list ...
+//	kvstore actor TYPE KEY [MESSAGE]              ask a virtual actor
 package main
 
 import (
@@ -51,6 +58,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  expire KEY DURATION | scan [prefix] | rm-prefix PREFIX | route KEY\n")
 		fmt.Fprintf(os.Stderr, "  health | metrics | export | import | compact | watch KEY\n")
 		fmt.Fprintf(os.Stderr, "  fault ADDR on|off | bench [N]\n")
+		fmt.Fprintf(os.Stderr, "mesh (kvmesh nodes):\n")
+		fmt.Fprintf(os.Stderr, "  mesh | lease acquire|renew|release|list ... | jobs enqueue|claim|complete|fail|list ...\n")
+		fmt.Fprintf(os.Stderr, "  actor TYPE KEY [MESSAGE]\n")
 	}
 	flag.Parse()
 
@@ -434,6 +444,9 @@ func main() {
 		ops := float64(n*2) / elapsed.Seconds()
 		fmt.Printf("%d put/get pairs (%d ops) in %s — %.0f ops/sec\n",
 			n, n*2, elapsed.Round(time.Millisecond), ops)
+
+	case "mesh", "lease", "jobs", "actor":
+		meshCmd(c, *gw, cmd, args)
 
 	default:
 		flag.Usage()
