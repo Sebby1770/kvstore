@@ -543,6 +543,11 @@ prefix (`memcmp`; empty prefix = full scan). Inserts that would return
   (encrypted, authenticated); links from a coordinator to its kvnodes are still
   the 1.x binary protocol, unencrypted and unauthenticated. Keep kvnodes on
   localhost or a private network. Moving kvnode onto KTP is the obvious next step.
+- **The HTTP API has no authentication** (as in 1.x): anyone who can reach a
+  node's HTTP port can write keys, take leases, change the ring or transfer
+  Raft leadership. Bind `--http` to localhost or a private network, or put it
+  behind an authenticating proxy. (The mesh port is protected: peers without
+  the cluster key cannot complete a KTP handshake or forge gossip.)
 - **KV writes are last-writer-wins.** Versions come from a quorum peek plus a
   Lamport clock; concurrent writers on different coordinators are ordered
   deterministically, not by real time. Use CAS, CRDTs, or a lease with its
