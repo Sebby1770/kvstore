@@ -1,15 +1,19 @@
 # HTTP gateway + CLI. Pure Go; talks to kvnodes over TCP.
 # Build context is the repository root.
-FROM golang:1.22-bookworm AS build
+FROM golang:1.25-bookworm AS build
 
 WORKDIR /src
 COPY kvgw ./kvgw
 WORKDIR /src/kvgw
 RUN CGO_ENABLED=0 go build -o /out/gateway ./cmd/gateway \
- && CGO_ENABLED=0 go build -o /out/kvstore ./cmd/kvstore
+ && CGO_ENABLED=0 go build -o /out/kvstore ./cmd/kvstore \
+ && CGO_ENABLED=0 go build -o /out/kvmesh ./cmd/kvmesh \
+ && CGO_ENABLED=0 go build -o /out/ktpcat ./cmd/ktpcat
 
 FROM debian:bookworm-slim
 COPY --from=build /out/gateway /usr/local/bin/gateway
 COPY --from=build /out/kvstore /usr/local/bin/kvstore
+COPY --from=build /out/kvmesh /usr/local/bin/kvmesh
+COPY --from=build /out/ktpcat /usr/local/bin/ktpcat
 EXPOSE 8090
 ENTRYPOINT ["gateway"]

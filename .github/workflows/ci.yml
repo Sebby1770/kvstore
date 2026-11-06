@@ -10,7 +10,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: kvgw/go.mod
       - uses: dtolnay/rust-toolchain@stable
-      - name: Test
+      - name: Test (C engine, Rust node, Go, JS client)
         run: make test
+      - name: Race detector (runtime + networking stack)
+        run: make test-race
+      - name: Full chaos suites
+        run: make chaos
+      - name: Fuzz smoke
+        run: make fuzz-smoke FUZZTIME=5s
+      - name: Mesh demo (real processes over UDP)
+        run: make mesh-demo

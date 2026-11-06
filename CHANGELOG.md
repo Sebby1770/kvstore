@@ -3,6 +3,77 @@
 All notable changes to KVStore are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.0.0] — 2026-10-29
+
+KVStore becomes a distributed systems runtime and networking stack, with the
+replicated KV store as its first application. Every Go package is standard
+library only; protocol cores are sans-IO state machines tested by seeded
+simulation.
+
+### Added
+
+**Networking stack (`kvgw/netstack`)**
+
+- `wire` — KTP packet header, QUIC varints, all frame types, CRC32C.
+- `ktp` — KTP transport: 1-RTT mutually authenticated handshake (X25519 +
+  Ed25519 over a transcript hash, HKDF salted with the cluster key, confirm MAC
+  so a wrong key fails immediately), AES-256-GCM packets, anti-amplification,
+  multiplexed streams with reassembly / FIN / reset / stop-sending, stream and
+  connection flow control, datagrams, ACK ranges, RFC 9002 loss detection and
+  PTO, NewReno, CUBIC and BBR (delivery-rate sampling, BBRv2 Startup exit),
+  pacing, keep-alive, idle/handshake timeouts, CONNECTION_CLOSE with draining,
+  stateless resets authenticated by the cluster key, sealed Raw datagrams.
+- `simnet` — in-memory `net.PacketConn` network with latency, jitter, loss,
+  duplication, reordering, corruption, bandwidth queues, MTU and partitions;
+  runs on virtual time inside `testing/synctest`.
+- `endpoint` — KTP over one UDP socket: dial/accept, one shared connection
+  per peer pair, goroutine-safe streams with deadlines, raw datagrams.
+- `rpc` — one call per stream: unary and server-streaming, gRPC status codes,
+  deadlines, cancellation that reaches the server, metadata, interceptors,
+  panic recovery, per-method stats, typed JSON helpers.
+
+**Distributed runtime (`kvgw/runtime`)**
+
+- `hlc` — hybrid logical clocks with max-offset protection.
+- `swim` — SWIM membership with Lifeguard (local health, dynamic suspicion,
+  nacks), incarnation refutation, piggybacked gossip, push-pull, partition
+  healing via reconnects to failed members and seeds.
+- `raft` — pre-vote, check-quorum, pipelined replication, ReadIndex,
+  snapshots, single-server membership changes, leadership transfer, message
+  validation, and a CRC-framed WAL with torn-tail truncation.
+- `control` — Raft-replicated control plane: the storage ring with epochs,
+  leases with fencing tokens, job queues (visibility timeouts, token-fenced
+  completion, retries with backoff, dead letters), a linearizable registry;
+  `Service` runs it with request tracking and linearizable reads.
+- `actor` — virtual actors: on-demand activation on the owner, turn-based
+  mailboxes, timers, idle deactivation, rebalancing, panic supervision, and
+  CAS-fenced state.
+- `node` + `cmd/kvmesh` — the mesh daemon: every node serves the KV API, the
+  ring comes from the control plane, founders bootstrap from a shared list,
+  joiners are added as learners and promoted; `/mesh` control room,
+  `/mesh/status`, `/mesh/metrics`, `/lease`, `/jobs`, `/registry`, `/actor`.
+- `cmd/ktpcat` — KTP netcat, benchmark and simulated-link tracer.
+- CLI: `kvstore mesh | lease … | jobs … | actor …`.
+- `scripts/mesh-demo.sh` / `make mesh-demo`; `make test-race`, `make chaos`,
+  `make fuzz-smoke`; CI runs all of them.
+
+### Changed
+
+- The coordinator's RF/R/W live in its atomic membership snapshot, and
+  `Reconfigure(epoch, …)` adopts control-plane rings monotonically.
+- The gateway's HTTP surface moved to `internal/httpapi`, shared with kvmesh;
+  OR-Set tags are prefixed per coordinator so they cannot collide.
+- Go 1.25 is required (for `testing/synctest` and `crypto/hkdf`).
+
+### Fixed
+
+- A write could mint a version from an incomplete peek of its replicas. A
+  restarted gateway reaching only a lagging replica reissued a version already
+  in use, and a write reported as failed could become the served value. Writes
+  now need a peek quorum (peek + W > RF). Replica copies are also ordered by
+  (version, state, value), so equal-version splits converge. These two fixes
+  were stranded on a branch lost in the triglot-kv → kvstore rename.
+
 ## [1.2.0] — 2026-09-02
 
 Prefix scan in the engine, prefix delete, operator fault injection, and

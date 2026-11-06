@@ -58,7 +58,7 @@ func TestCRDTCounterNoLostUpdates(t *testing.T) {
 // A counter must stay correct even when a replica misses some increments and is
 // later folded back in by the read-all-then-merge.
 func TestCRDTCounterConvergesAfterReplicaDown(t *testing.T) {
-	c, fakes := build(4, 3, 2, 1) // W=1 so a write lands with a replica down
+	c, fakes := build(4, 3, 2, 2) // one replica down still leaves a write + peek quorum
 	byAddr := map[string]*fakeNode{}
 	for _, f := range fakes {
 		byAddr[f.addr] = f

@@ -15,6 +15,7 @@
 package cluster
 
 import (
+	"bytes"
 	"errors"
 	"sort"
 	"strings"
@@ -41,11 +42,22 @@ var errDownSentinel = errors.New("replica known down")
 // membership is an immutable snapshot of the cluster's nodes and their ring.
 // Changing membership swaps in a brand-new snapshot atomically, so readers never
 // see a half-updated ring and never need a lock on the hot path.
+//
+// The configured RF/R/W live in the snapshot too: under kvmesh the control
+// plane changes them at runtime, and keeping them beside the ring means a
+// reconfiguration is one atomic swap rather than a data race on plain ints.
 type membership struct {
 	ring  *ring.Ring
 	nodes map[string]kv.Node
 	addrs []string
+	rf, r int // configured; effective values clamp to the live size
+	w     int
+	epoch uint64 // control-plane ring epoch (0 for a standalone gateway)
 }
+
+func (m *membership) effRF() int { return effectiveRF(m.rf, len(m.addrs)) }
+func (m *membership) effR() int  { return clampQuorum(m.r, m.effRF()) }
+func (m *membership) effW() int  { return clampQuorum(m.w, m.effRF()) }
 
 type hbState struct {
 	down   bool
@@ -55,9 +67,6 @@ type hbState struct {
 
 type Cluster struct {
 	members atomic.Value // *membership
-	rfCfg   int          // configured RF/R/W; effective values clamp to live size
-	rCfg    int
-	wCfg    int
 	clock   lamport
 	locks   keyedMutex
 	memMu   sync.Mutex // serialises membership changes
@@ -164,11 +173,10 @@ func (k *keyedMutex) lock(key string) func() {
 // nodes join and leave.
 func New(nodes map[string]kv.Node, addrs []string, rf, r, w int) *Cluster {
 	c := &Cluster{
-		rfCfg: rf, rCfg: r, wCfg: w,
 		hb:    make(map[string]*hbState),
 		hints: make(map[string][]hint),
 	}
-	c.setMembership(addrs, nodes)
+	c.members.Store(newMembership(addrs, nodes, rf, r, w, 0))
 	return c
 }
 
@@ -186,10 +194,54 @@ func (c *Cluster) Now() time.Time {
 
 func (c *Cluster) snap() *membership { return c.members.Load().(*membership) }
 
-func (c *Cluster) setMembership(addrs []string, nodes map[string]kv.Node) {
+func newMembership(addrs []string, nodes map[string]kv.Node, rf, r, w int, epoch uint64) *membership {
 	cp := make([]string, len(addrs))
 	copy(cp, addrs)
-	c.members.Store(&membership{ring: ring.New(cp), nodes: nodes, addrs: cp})
+	return &membership{ring: ring.New(cp), nodes: nodes, addrs: cp, rf: rf, r: r, w: w, epoch: epoch}
+}
+
+// setMembership swaps in a new ring, keeping the quorum configuration.
+func (c *Cluster) setMembership(addrs []string, nodes map[string]kv.Node) {
+	m := c.snap()
+	c.members.Store(newMembership(addrs, nodes, m.rf, m.r, m.w, m.epoch))
+}
+
+// Reconfigure atomically replaces the ring, the quorum settings, and the
+// epoch -- the way a kvmesh node adopts a ring committed by the control plane.
+// nodes must hold a client for every address in addrs (reuse existing clients
+// so their connections survive). Configurations at or below the current epoch
+// are ignored, so a late, out-of-order apply can never roll the ring back.
+// It returns false when the epoch was stale.
+func (c *Cluster) Reconfigure(epoch uint64, addrs []string, nodes map[string]kv.Node, rf, r, w int) bool {
+	c.memMu.Lock()
+	defer c.memMu.Unlock()
+	old := c.snap()
+	if epoch <= old.epoch {
+		return false
+	}
+	c.members.Store(newMembership(addrs, nodes, rf, r, w, epoch))
+	keep := make(map[string]bool, len(addrs))
+	for _, a := range addrs {
+		keep[a] = true
+	}
+	for _, a := range old.addrs {
+		if !keep[a] {
+			c.dropHints(a)
+			c.hbMu.Lock()
+			delete(c.hb, a)
+			c.hbMu.Unlock()
+		}
+	}
+	return true
+}
+
+// Epoch is the control-plane ring epoch currently served (0 = standalone).
+func (c *Cluster) Epoch() uint64 { return c.snap().epoch }
+
+// Node returns the client for addr if it is in the current ring.
+func (c *Cluster) Node(addr string) (kv.Node, bool) {
+	n, ok := c.snap().nodes[addr]
+	return n, ok
 }
 
 func effectiveRF(cfg, n int) int {
@@ -212,16 +264,21 @@ func clampQuorum(q, rf int) int {
 	return q
 }
 
-func (c *Cluster) RF() int          { return effectiveRF(c.rfCfg, len(c.snap().addrs)) }
-func (c *Cluster) R() int           { return clampQuorum(c.rCfg, c.RF()) }
-func (c *Cluster) W() int           { return clampQuorum(c.wCfg, c.RF()) }
-func (c *Cluster) Addrs() []string  { return c.snap().addrs }
-func (c *Cluster) Consistent() bool { return c.R()+c.W() > c.RF() } // R + W > RF
+func (c *Cluster) RF() int         { return c.snap().effRF() }
+func (c *Cluster) R() int          { return c.snap().effR() }
+func (c *Cluster) W() int          { return c.snap().effW() }
+func (c *Cluster) Addrs() []string { return c.snap().addrs }
+
+// Consistent reports R + W > RF, judged on one snapshot.
+func (c *Cluster) Consistent() bool {
+	m := c.snap()
+	return m.effR()+m.effW() > m.effRF()
+}
 
 // Route returns the replica set (preference list) for a key.
 func (c *Cluster) Route(key []byte) []string {
 	m := c.snap()
-	return m.ring.Preflist(key, effectiveRF(c.rfCfg, len(m.addrs)))
+	return m.ring.Preflist(key, m.effRF())
 }
 
 // AddNode brings a node into the cluster at runtime. Rendezvous hashing means
@@ -275,7 +332,7 @@ func (c *Cluster) RemoveNode(addr string) bool {
 
 func (c *Cluster) replicas(key []byte) ([]string, []kv.Node) {
 	m := c.snap()
-	addrs := m.ring.Preflist(key, effectiveRF(c.rfCfg, len(m.addrs)))
+	addrs := m.ring.Preflist(key, m.effRF())
 	out := make([]kv.Node, 0, len(addrs))
 	for _, a := range addrs {
 		if n, ok := m.nodes[a]; ok {
@@ -452,6 +509,46 @@ func gatherReads(addrs []string, nodes []kv.Node, key []byte) []nodeRead {
 	return out
 }
 
+// statePriority orders the three replica states for tie-breaking. A tombstone
+// outranks a live value so a concurrent write can never resurrect a delete.
+func statePriority(s kv.State) int {
+	switch s {
+	case kv.Deleted:
+		return 2
+	case kv.Present:
+		return 1
+	default: // kv.Missing
+		return 0
+	}
+}
+
+// beats reports whether a should win over b under a total order that every
+// replica and every gateway evaluates identically: version first, then state,
+// then the value bytes.
+//
+// The value comparison is what makes ties survivable. Ordering only by version
+// leaves two replicas holding different values at the same version equally
+// "best", so the winner becomes whichever replica answered first and
+// read-repair sees nothing to fix -- the split never heals. Comparing the bytes
+// is arbitrary but deterministic, which is all convergence requires. Ties can
+// still arise from two gateways minting concurrently (each peeks the same
+// maximum), so this is load-bearing once there is more than one coordinator.
+func beats(a, b kv.ReadResult) bool {
+	if a.Version != b.Version {
+		return a.Version > b.Version
+	}
+	if a.State != b.State {
+		return statePriority(a.State) > statePriority(b.State)
+	}
+	return bytes.Compare(a.Value, b.Value) > 0
+}
+
+// current reports whether a replica already holds exactly the winning copy.
+func current(have, best kv.ReadResult) bool {
+	return have.Version == best.Version && have.State == best.State &&
+		(have.State != kv.Present || bytes.Equal(have.Value, best.Value))
+}
+
 // ReadMeta describes how a read was served (for response headers / debugging).
 type ReadMeta struct {
 	Replicas   []string
@@ -478,7 +575,7 @@ func (c *Cluster) Get(key []byte) (value []byte, found bool, meta ReadMeta, err 
 		}
 		meta.Responders = append(meta.Responders, rd.addr)
 		c.clock.witness(rd.res.Version)
-		if !haveBest || rd.res.Version > best.Version {
+		if !haveBest || beats(rd.res, best) {
 			best = rd.res
 			haveBest = true
 		}
@@ -525,8 +622,8 @@ func (c *Cluster) readRepair(key []byte, reads []nodeRead, best kv.ReadResult) [
 		if rd.err != nil {
 			continue
 		}
-		if rd.res.Version >= best.Version && rd.res.State == best.State {
-			continue // already current
+		if current(rd.res, best) {
+			continue // already holds the winning copy
 		}
 		node := c.snap().nodes[rd.addr]
 		if node == nil {
@@ -558,19 +655,47 @@ type WriteMeta struct {
 	Version  uint64
 }
 
-// peekMaxVersion reads the replica set best-effort to learn the highest version
-// in play, so the new write supersedes it.
-func (c *Cluster) peekMaxVersion(addrs []string, nodes []kv.Node, key []byte) uint64 {
-	var maxv uint64
+// peekQuorum is how many replicas a write must hear from before it may mint a
+// version: the peek has to intersect every possible earlier write quorum
+// (peek + W > RF), or it can miss the newest acknowledged version.
+//
+// Reading a smaller subset is not good enough. A gateway whose Lamport clock
+// has just restarted at zero, talking only to a lagging replica, would reissue
+// a version already in use -- or mint one *below* the newest acknowledged
+// write, so the new write "succeeds" and is then silently outranked forever.
+// The cost is availability: with W=1 every replica must answer the peek, which
+// is the honest price of a write that only needs one ack.
+func (c *Cluster) peekQuorum(replicaCount int) int {
+	need := replicaCount - c.W() + 1
+	if need < 1 {
+		need = 1
+	}
+	return need
+}
+
+// mintQuorum is the responder count a read-modify-write (CAS, Mutate) needs:
+// a read quorum for the read, and a peek quorum for the version it mints.
+func (c *Cluster) mintQuorum(replicaCount int) int {
+	if q := c.peekQuorum(replicaCount); q > c.R() {
+		return q
+	}
+	return c.R()
+}
+
+// peekMaxVersion reads the replica set to learn the highest version in play, so
+// the new write supersedes it. It also reports how many replicas answered;
+// callers must check that against peekQuorum before minting from the result.
+func (c *Cluster) peekMaxVersion(addrs []string, nodes []kv.Node, key []byte) (maxv uint64, responders int) {
 	for _, rd := range gatherReads(addrs, nodes, key) {
 		if rd.err == nil {
+			responders++
 			c.clock.witness(rd.res.Version)
 			if rd.res.Version > maxv {
 				maxv = rd.res.Version
 			}
 		}
 	}
-	return maxv
+	return maxv, responders
 }
 
 // Put performs a quorum write (last-writer-wins by assigned version).
@@ -592,7 +717,14 @@ func (c *Cluster) putAt(key, val []byte, expiresAt uint64) (WriteMeta, error) {
 	defer func() { c.observePut(time.Since(start)) }()
 	atomic.AddUint64(&c.mPuts, 1)
 	addrs, nodes := c.replicas(key)
-	version := c.clock.tick(c.peekMaxVersion(addrs, nodes, key))
+	seen, responders := c.peekMaxVersion(addrs, nodes, key)
+	if responders < c.peekQuorum(len(addrs)) {
+		// Too few replicas answered to be sure we have seen the newest
+		// acknowledged version, so any version minted here could collide.
+		atomic.AddUint64(&c.mQuorumFails, 1)
+		return WriteMeta{Replicas: addrs, Required: c.W()}, ErrQuorum
+	}
+	version := c.clock.tick(seen)
 	return c.broadcastPut(addrs, nodes, key, val, version, expiresAt)
 }
 
@@ -626,7 +758,12 @@ func (c *Cluster) broadcastPut(addrs []string, nodes []kv.Node, key, val []byte,
 func (c *Cluster) Del(key []byte) (existed bool, meta WriteMeta, err error) {
 	atomic.AddUint64(&c.mDels, 1)
 	addrs, nodes := c.replicas(key)
-	version := c.clock.tick(c.peekMaxVersion(addrs, nodes, key))
+	seen, responders := c.peekMaxVersion(addrs, nodes, key)
+	if responders < c.peekQuorum(len(addrs)) {
+		atomic.AddUint64(&c.mQuorumFails, 1)
+		return false, WriteMeta{Replicas: addrs, Required: c.W()}, ErrQuorum
+	}
+	version := c.clock.tick(seen)
 
 	acks := 0
 	anyExisted := false
@@ -688,7 +825,7 @@ func (c *Cluster) Mutate(key []byte, apply func(states [][]byte) ([]byte, error)
 			states = append(states, rd.res.Value)
 		}
 	}
-	if responders < c.R() {
+	if responders < c.mintQuorum(len(addrs)) {
 		atomic.AddUint64(&c.mQuorumFails, 1)
 		return nil, WriteMeta{Replicas: addrs, Required: c.W()}, ErrQuorum
 	}
@@ -801,7 +938,9 @@ func (c *Cluster) mergeScan(includeTombs bool) (map[string]*mergedRow, []string)
 				continue
 			}
 			a.replicas++
-			if e.Version > a.version {
+			cand := kv.ReadResult{Version: e.Version, Value: e.Value, State: entryState(e)}
+			have := kv.ReadResult{Version: a.version, Value: a.raw, State: rowState(a)}
+			if beats(cand, have) {
 				a.version = e.Version
 				a.raw = append([]byte(nil), e.Value...)
 				a.expiresAt = e.ExpiresAt
@@ -810,6 +949,20 @@ func (c *Cluster) mergeScan(includeTombs bool) (map[string]*mergedRow, []string)
 		}
 	}
 	return merged, errs
+}
+
+func entryState(e kv.Entry) kv.State {
+	if e.Tombstone {
+		return kv.Deleted
+	}
+	return kv.Present
+}
+
+func rowState(r *mergedRow) kv.State {
+	if r.deleted {
+		return kv.Deleted
+	}
+	return kv.Present
 }
 
 // RepairSweep proactively re-replicates every key's freshest value (and
@@ -839,7 +992,7 @@ func (c *Cluster) RepairSweep() (int, []string) {
 			best.State = kv.Present
 		}
 		for _, rd := range reads {
-			if rd.err == nil && rd.res.Version > best.Version {
+			if rd.err == nil && beats(rd.res, best) {
 				best = rd.res
 			}
 		}
@@ -855,7 +1008,7 @@ func (c *Cluster) RepairSweep() (int, []string) {
 			if rd.err != nil {
 				continue
 			}
-			if rd.res.Version >= best.Version && rd.res.State == best.State {
+			if current(rd.res, best) {
 				continue
 			}
 			node := c.snap().nodes[rd.addr]

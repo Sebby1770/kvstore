@@ -184,6 +184,18 @@ func build(n, rf, r, w int) (*Cluster, []*fakeNode) {
 	return New(nodes, addrs, rf, r, w), fakes
 }
 
+// rebuild makes a fresh Cluster over existing replicas -- i.e. a gateway
+// restart, which resets the Lamport clock while the data survives.
+func rebuild(fakes []*fakeNode, n, rf, r, w int) (*Cluster, []*fakeNode) {
+	addrs := make([]string, n)
+	nodes := map[string]kv.Node{}
+	for i := 0; i < n; i++ {
+		addrs[i] = fakes[i].addr
+		nodes[addrs[i]] = fakes[i]
+	}
+	return New(nodes, addrs, rf, r, w), fakes
+}
+
 func TestPutThenGet(t *testing.T) {
 	c, _ := build(3, 3, 2, 2)
 	if _, err := c.Put([]byte("hello"), []byte("world")); err != nil {
@@ -242,7 +254,12 @@ func TestWriteQuorumFailsWithTooManyDown(t *testing.T) {
 }
 
 func TestReadRepairHealsStaleReplica(t *testing.T) {
-	c, fakes := build(3, 3, 3, 1) // W=1 lets a write land with replicas down
+	// RF=3, R=2, W=2. A write still lands with one replica down (acks=2=W),
+	// and the version peek can still intersect any prior write quorum
+	// (needs RF-W+1 = 2 responders). W=1 would let a write land on a single
+	// replica, which no partial peek can be guaranteed to observe, so a
+	// version minted under it could collide with one already in use.
+	c, fakes := build(3, 3, 2, 2)
 	// First write reaches everyone.
 	if _, err := c.Put([]byte("k"), []byte("v1")); err != nil {
 		t.Fatal(err)
@@ -319,7 +336,10 @@ func TestScanMergesByKey(t *testing.T) {
 }
 
 func TestAntiEntropyHealsWithoutAClientRead(t *testing.T) {
-	c, fakes := build(4, 3, 2, 1) // W=1: a write lands even with a replica down
+	// RF=3 over 4 nodes with R=2, W=2: a write survives one replica being
+	// down while still allowing a safe version peek (see the note in
+	// TestReadRepairHealsStaleReplica).
+	c, fakes := build(4, 3, 2, 2)
 	byAddr := map[string]*fakeNode{}
 	for _, f := range fakes {
 		byAddr[f.addr] = f
