@@ -11,3 +11,14 @@ path = "src/main.rs"
 [profile.release]
 lto = "thin"
 strip = true
+
+[dependencies]
+# KTP (encrypted transport to the coordinators). RustCrypto + dalek: the same
+# primitives the Go implementation uses from its standard library.
+aes-gcm = "0.10"
+ed25519-dalek = "2"
+getrandom = "0.2"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
