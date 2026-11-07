@@ -252,6 +252,11 @@ var errAuth = errors.New("ktp: packet failed authentication")
 // open verifies and returns the payload of pkt (whose header is h).
 func (p *protector) open(h wire.Header, pkt []byte) ([]byte, error) {
 	if p == nil || p.aead == nil {
+		// A header-only datagram can still "verify" when its last four bytes
+		// happen to be the CRC of the first 24; it has no payload to return.
+		if len(pkt) < wire.HeaderLen+4 {
+			return nil, errAuth
+		}
 		body, ok := wire.VerifyChecksum(pkt)
 		if !ok {
 			return nil, errAuth
