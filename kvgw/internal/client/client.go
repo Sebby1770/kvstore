@@ -6,11 +6,12 @@
 //	                  authenticated, keyed to the cluster secret
 //	host:port         plain TCP (also tcp://host:port)
 //
-// Each Client holds one TCP connection or one KTP stream, reused across calls
-// and re-opened once if it has gone stale (the common failure mode when a
-// node restarts between requests; over KTP the restarted node answers with
-// a stateless reset, so the stale connection is noticed at once). It
-// implements kv.Node so the quorum coordinator can drive it.
+// Each Client keeps a few TCP connections or KTP streams (MaxConns), each
+// carrying one request at a time, reused across calls and re-opened once if
+// stale (the common failure mode when a node restarts between requests; over
+// KTP the restarted node answers with a stateless reset, so the stale
+// connection is noticed at once). It implements kv.Node so the quorum
+// coordinator can drive it.
 package client
 
 import (
@@ -20,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -74,35 +76,51 @@ func (t ktpTransport) abort() {
 	t.Stream.CancelRead(abortCode)
 }
 
+// MaxConns is how many requests one Client runs at once, each on its own
+// TCP connection or KTP stream, so that a slow request (a big scan, a node
+// that stopped answering) never queues the others behind it.
+const MaxConns = 4
+
 type Client struct {
 	addr    string // as configured, scheme included: the node's ring identity
 	timeout time.Duration
 	dial    func(ctx context.Context) (transport, error)
+	slots   chan struct{} // one per request in flight
 
-	mu   sync.Mutex
-	conn transport
-	r    *bufio.Reader
-	w    *bufio.Writer
+	mu     sync.Mutex
+	idle   []*conn // ready for reuse, most recently used last
+	closed bool
+}
+
+// conn is one connection or stream with its buffers.
+type conn struct {
+	t transport
+	r *bufio.Reader
+	w *bufio.Writer
+}
+
+func newClient(addr string, timeout time.Duration, dial func(ctx context.Context) (transport, error)) *Client {
+	return &Client{addr: addr, timeout: timeout, dial: dial, slots: make(chan struct{}, MaxConns)}
 }
 
 // New returns a TCP client for addr ("host:port" or "tcp://host:port").
 func New(addr string, timeout time.Duration) *Client {
 	hostport := strings.TrimPrefix(addr, SchemeTCP)
-	return &Client{addr: addr, timeout: timeout, dial: func(ctx context.Context) (transport, error) {
+	return newClient(addr, timeout, func(ctx context.Context) (transport, error) {
 		var d net.Dialer
 		conn, err := d.DialContext(ctx, "tcp", hostport)
 		if err != nil {
 			return nil, err
 		}
 		return tcpTransport{conn}, nil
-	}}
+	})
 }
 
 // NewKTP returns a client for addr ("ktp://host:port") whose requests travel
 // on a stream of ep's (shared, per-peer) connection to the node.
 func NewKTP(addr string, ep *endpoint.Endpoint, timeout time.Duration) *Client {
 	hostport := strings.TrimPrefix(addr, SchemeKTP)
-	return &Client{addr: addr, timeout: timeout, dial: func(ctx context.Context) (transport, error) {
+	return newClient(addr, timeout, func(ctx context.Context) (transport, error) {
 		conn, err := ep.Conn(ctx, hostport)
 		if err != nil {
 			return nil, fmt.Errorf("ktp %s: %w", hostport, err)
@@ -112,7 +130,7 @@ func NewKTP(addr string, ep *endpoint.Endpoint, timeout time.Duration) *Client {
 			return nil, fmt.Errorf("ktp %s: open stream: %w", hostport, err)
 		}
 		return ktpTransport{s}, nil
-	}}
+	})
 }
 
 // Open returns a client for addr, choosing the transport by scheme; ep is
@@ -132,15 +150,14 @@ func Open(addr string, ep *endpoint.Endpoint, timeout time.Duration) (*Client, e
 	default:
 		err = fmt.Errorf("client: unsupported address scheme in %q (use host:port or ktp://host:port)", addr)
 	}
-	return &Client{addr: addr, timeout: timeout, dial: func(context.Context) (transport, error) { return nil, err }}, err
+	return newClient(addr, timeout, func(context.Context) (transport, error) { return nil, err }), err
 }
 
 func (c *Client) Addr() string { return c.addr }
 
-func (c *Client) connect() error {
-	if c.conn != nil {
-		return nil
-	}
+var errClosed = errors.New("client: closed")
+
+func (c *Client) dialConn() (*conn, error) {
 	ctx := context.Background()
 	if c.timeout > 0 {
 		var cancel context.CancelFunc
@@ -149,23 +166,38 @@ func (c *Client) connect() error {
 	}
 	t, err := c.dial(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	c.conn = t
-	c.r = bufio.NewReader(t)
-	c.w = bufio.NewWriter(t)
-	return nil
+	return &conn{t: t, r: bufio.NewReader(t), w: bufio.NewWriter(t)}, nil
 }
 
-// reset abandons the connection after a failed exchange: whatever it still
-// carries belongs to a request nobody waits for any more.
-func (c *Client) reset() {
-	if c.conn != nil {
-		c.conn.abort()
+// take returns an idle connection (fresh=false) or dials one.
+func (c *Client) take() (cn *conn, fresh bool, err error) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, false, errClosed
 	}
-	c.conn = nil
-	c.r = nil
-	c.w = nil
+	if n := len(c.idle); n > 0 {
+		cn = c.idle[n-1]
+		c.idle = c.idle[:n-1]
+		c.mu.Unlock()
+		return cn, false, nil
+	}
+	c.mu.Unlock()
+	cn, err = c.dialConn()
+	return cn, true, err
+}
+
+// give returns a connection after a clean exchange.
+func (c *Client) give(cn *conn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		cn.t.close()
+		return
+	}
+	c.idle = append(c.idle, cn)
 }
 
 func (c *Client) deadline() time.Time {
@@ -175,33 +207,46 @@ func (c *Client) deadline() time.Time {
 	return time.Now().Add(c.timeout)
 }
 
-// withConn runs fn with the connection locked, reconnecting once if a
-// previously-cached connection has gone stale.
-func (c *Client) withConn(fn func() error) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// withConn runs fn on a connection of its own (at most MaxConns at once),
+// retrying once on a fresh connection if a cached one had gone stale. A
+// connection that failed mid-exchange is aborted, never reused: whatever it
+// still carries belongs to a request nobody waits for any more.
+func (c *Client) withConn(fn func(cn *conn) error) error {
+	var timeout <-chan time.Time
+	if c.timeout > 0 {
+		t := time.NewTimer(c.timeout)
+		defer t.Stop()
+		timeout = t.C
+	}
+	select {
+	case c.slots <- struct{}{}:
+	case <-timeout:
+		return fmt.Errorf("client %s: %d requests already in flight: %w", c.addr, MaxConns, os.ErrDeadlineExceeded)
+	}
+	defer func() { <-c.slots }()
 
-	fresh := c.conn == nil
-	if err := c.connect(); err != nil {
+	cn, fresh, err := c.take()
+	if err != nil {
 		return err
 	}
-	c.conn.SetDeadline(c.deadline())
-	err := fn()
-	if err == nil {
+	cn.t.SetDeadline(c.deadline())
+	if err = fn(cn); err == nil {
+		c.give(cn)
 		return nil
 	}
-	c.reset()
+	cn.t.abort()
 	if fresh || !retryable(err) {
 		return err
 	}
-	if err := c.connect(); err != nil {
+	if cn, err = c.dialConn(); err != nil {
 		return err
 	}
-	c.conn.SetDeadline(c.deadline())
-	if err := fn(); err != nil {
-		c.reset()
+	cn.t.SetDeadline(c.deadline())
+	if err := fn(cn); err != nil {
+		cn.t.abort()
 		return err
 	}
+	c.give(cn)
 	return nil
 }
 
@@ -217,14 +262,14 @@ func retryable(err error) bool {
 }
 
 func (c *Client) Ping() error {
-	return c.withConn(func() error {
-		if err := proto.WriteU8(c.w, proto.OpPing); err != nil {
+	return c.withConn(func(cn *conn) error {
+		if err := proto.WriteU8(cn.w, proto.OpPing); err != nil {
 			return err
 		}
-		if err := c.w.Flush(); err != nil {
+		if err := cn.w.Flush(); err != nil {
 			return err
 		}
-		s, err := proto.ReadU8(c.r)
+		s, err := proto.ReadU8(cn.r)
 		if err != nil {
 			return err
 		}
@@ -237,30 +282,30 @@ func (c *Client) Ping() error {
 
 func (c *Client) Stat() (kv.Stat, error) {
 	var st kv.Stat
-	err := c.withConn(func() error {
-		if err := proto.WriteU8(c.w, proto.OpStat); err != nil {
+	err := c.withConn(func(cn *conn) error {
+		if err := proto.WriteU8(cn.w, proto.OpStat); err != nil {
 			return err
 		}
-		if err := c.w.Flush(); err != nil {
+		if err := cn.w.Flush(); err != nil {
 			return err
 		}
-		s, err := proto.ReadU8(c.r)
+		s, err := proto.ReadU8(cn.r)
 		if err != nil {
 			return err
 		}
 		if s != proto.StatusOK {
 			return fmt.Errorf("stat: %s", proto.StatusString(s))
 		}
-		if st.Count, err = proto.ReadU32(c.r); err != nil {
+		if st.Count, err = proto.ReadU32(cn.r); err != nil {
 			return err
 		}
-		if st.Capacity, err = proto.ReadU32(c.r); err != nil {
+		if st.Capacity, err = proto.ReadU32(cn.r); err != nil {
 			return err
 		}
-		if st.MaxVersion, err = proto.ReadU64(c.r); err != nil {
+		if st.MaxVersion, err = proto.ReadU64(cn.r); err != nil {
 			return err
 		}
-		st.Tombstones, err = proto.ReadU32(c.r)
+		st.Tombstones, err = proto.ReadU32(cn.r)
 		return err
 	})
 	return st, err
@@ -268,50 +313,50 @@ func (c *Client) Stat() (kv.Stat, error) {
 
 func (c *Client) Get(key []byte) (kv.ReadResult, error) {
 	var res kv.ReadResult
-	err := c.withConn(func() error {
+	err := c.withConn(func(cn *conn) error {
 		res = kv.ReadResult{}
-		if err := proto.WriteU8(c.w, proto.OpGet); err != nil {
+		if err := proto.WriteU8(cn.w, proto.OpGet); err != nil {
 			return err
 		}
-		if err := proto.WriteU32(c.w, uint32(len(key))); err != nil {
+		if err := proto.WriteU32(cn.w, uint32(len(key))); err != nil {
 			return err
 		}
-		if err := proto.WriteBytes(c.w, key); err != nil {
+		if err := proto.WriteBytes(cn.w, key); err != nil {
 			return err
 		}
-		if err := c.w.Flush(); err != nil {
+		if err := cn.w.Flush(); err != nil {
 			return err
 		}
-		s, err := proto.ReadU8(c.r)
+		s, err := proto.ReadU8(cn.r)
 		if err != nil {
 			return err
 		}
 		switch s {
 		case proto.StatusOK:
-			ver, err := proto.ReadU64(c.r)
+			ver, err := proto.ReadU64(cn.r)
 			if err != nil {
 				return err
 			}
-			exp, err := proto.ReadU64(c.r)
+			exp, err := proto.ReadU64(cn.r)
 			if err != nil {
 				return err
 			}
-			n, err := proto.ReadU32(c.r)
+			n, err := proto.ReadU32(cn.r)
 			if err != nil {
 				return err
 			}
-			val, err := proto.ReadBytes(c.r, n)
+			val, err := proto.ReadBytes(cn.r, n)
 			if err != nil {
 				return err
 			}
 			res = kv.ReadResult{State: kv.Present, Value: val, Version: ver, ExpiresAt: exp}
 			return nil
 		case proto.StatusDeleted:
-			ver, err := proto.ReadU64(c.r)
+			ver, err := proto.ReadU64(cn.r)
 			if err != nil {
 				return err
 			}
-			exp, err := proto.ReadU64(c.r)
+			exp, err := proto.ReadU64(cn.r)
 			if err != nil {
 				return err
 			}
@@ -332,32 +377,32 @@ func (c *Client) Put(key, val []byte, version uint64) error {
 }
 
 func (c *Client) PutX(key, val []byte, version, expiresAt uint64) error {
-	return c.withConn(func() error {
-		if err := proto.WriteU8(c.w, proto.OpPutX); err != nil {
+	return c.withConn(func(cn *conn) error {
+		if err := proto.WriteU8(cn.w, proto.OpPutX); err != nil {
 			return err
 		}
-		if err := proto.WriteU32(c.w, uint32(len(key))); err != nil {
+		if err := proto.WriteU32(cn.w, uint32(len(key))); err != nil {
 			return err
 		}
-		if err := proto.WriteBytes(c.w, key); err != nil {
+		if err := proto.WriteBytes(cn.w, key); err != nil {
 			return err
 		}
-		if err := proto.WriteU64(c.w, version); err != nil {
+		if err := proto.WriteU64(cn.w, version); err != nil {
 			return err
 		}
-		if err := proto.WriteU64(c.w, expiresAt); err != nil {
+		if err := proto.WriteU64(cn.w, expiresAt); err != nil {
 			return err
 		}
-		if err := proto.WriteU32(c.w, uint32(len(val))); err != nil {
+		if err := proto.WriteU32(cn.w, uint32(len(val))); err != nil {
 			return err
 		}
-		if err := proto.WriteBytes(c.w, val); err != nil {
+		if err := proto.WriteBytes(cn.w, val); err != nil {
 			return err
 		}
-		if err := c.w.Flush(); err != nil {
+		if err := cn.w.Flush(); err != nil {
 			return err
 		}
-		s, err := proto.ReadU8(c.r)
+		s, err := proto.ReadU8(cn.r)
 		if err != nil {
 			return err
 		}
@@ -370,24 +415,24 @@ func (c *Client) PutX(key, val []byte, version, expiresAt uint64) error {
 
 func (c *Client) Del(key []byte, version uint64) (bool, error) {
 	var existed bool
-	err := c.withConn(func() error {
+	err := c.withConn(func(cn *conn) error {
 		existed = false
-		if err := proto.WriteU8(c.w, proto.OpDel); err != nil {
+		if err := proto.WriteU8(cn.w, proto.OpDel); err != nil {
 			return err
 		}
-		if err := proto.WriteU32(c.w, uint32(len(key))); err != nil {
+		if err := proto.WriteU32(cn.w, uint32(len(key))); err != nil {
 			return err
 		}
-		if err := proto.WriteBytes(c.w, key); err != nil {
+		if err := proto.WriteBytes(cn.w, key); err != nil {
 			return err
 		}
-		if err := proto.WriteU64(c.w, version); err != nil {
+		if err := proto.WriteU64(cn.w, version); err != nil {
 			return err
 		}
-		if err := c.w.Flush(); err != nil {
+		if err := cn.w.Flush(); err != nil {
 			return err
 		}
-		s, err := proto.ReadU8(c.r)
+		s, err := proto.ReadU8(cn.r)
 		if err != nil {
 			return err
 		}
@@ -407,15 +452,15 @@ func (c *Client) Del(key []byte, version uint64) (bool, error) {
 
 func (c *Client) scanOp(op byte, withTomb bool) ([]kv.Entry, error) {
 	var out []kv.Entry
-	err := c.withConn(func() error {
+	err := c.withConn(func(cn *conn) error {
 		out = nil
-		if err := proto.WriteU8(c.w, op); err != nil {
+		if err := proto.WriteU8(cn.w, op); err != nil {
 			return err
 		}
-		if err := c.w.Flush(); err != nil {
+		if err := cn.w.Flush(); err != nil {
 			return err
 		}
-		s, err := proto.ReadU8(c.r)
+		s, err := proto.ReadU8(cn.r)
 		if err != nil {
 			return err
 		}
@@ -423,37 +468,37 @@ func (c *Client) scanOp(op byte, withTomb bool) ([]kv.Entry, error) {
 			return fmt.Errorf("scan: %s", proto.StatusString(s))
 		}
 		for {
-			klen, err := proto.ReadU32(c.r)
+			klen, err := proto.ReadU32(cn.r)
 			if err != nil {
 				return err
 			}
 			if klen == proto.ScanTerminator {
 				return nil
 			}
-			key, err := proto.ReadBytes(c.r, klen)
+			key, err := proto.ReadBytes(cn.r, klen)
 			if err != nil {
 				return err
 			}
-			ver, err := proto.ReadU64(c.r)
+			ver, err := proto.ReadU64(cn.r)
 			if err != nil {
 				return err
 			}
-			exp, err := proto.ReadU64(c.r)
+			exp, err := proto.ReadU64(cn.r)
 			if err != nil {
 				return err
 			}
 			var tomb byte
 			if withTomb {
-				tomb, err = proto.ReadU8(c.r)
+				tomb, err = proto.ReadU8(cn.r)
 				if err != nil {
 					return err
 				}
 			}
-			vlen, err := proto.ReadU32(c.r)
+			vlen, err := proto.ReadU32(cn.r)
 			if err != nil {
 				return err
 			}
-			val, err := proto.ReadBytes(c.r, vlen)
+			val, err := proto.ReadBytes(cn.r, vlen)
 			if err != nil {
 				return err
 			}
@@ -478,14 +523,14 @@ func (c *Client) ScanAll() ([]kv.Entry, error) {
 }
 
 func (c *Client) Compact() error {
-	return c.withConn(func() error {
-		if err := proto.WriteU8(c.w, proto.OpCompact); err != nil {
+	return c.withConn(func(cn *conn) error {
+		if err := proto.WriteU8(cn.w, proto.OpCompact); err != nil {
 			return err
 		}
-		if err := c.w.Flush(); err != nil {
+		if err := cn.w.Flush(); err != nil {
 			return err
 		}
-		s, err := proto.ReadU8(c.r)
+		s, err := proto.ReadU8(cn.r)
 		if err != nil {
 			return err
 		}
@@ -496,12 +541,14 @@ func (c *Client) Compact() error {
 	})
 }
 
-// Close releases the connection (or stream).
+// Close releases the client's connections (or streams); requests still in
+// flight release theirs when they finish.
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.conn != nil {
-		c.conn.close()
+	c.closed = true
+	for _, cn := range c.idle {
+		cn.t.close()
 	}
-	c.conn, c.r, c.w = nil, nil, nil
+	c.idle = nil
 }

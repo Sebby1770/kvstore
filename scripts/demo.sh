@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Spin up a replicated KVStore cluster and prove quorum, read-repair, and
-# hinted handoff. Self-cleaning.
+# hinted handoff. The gateway reaches its storage nodes over KTP: encrypted,
+# authenticated UDP, served by kvnode's own Rust implementation of the
+# protocol. Self-cleaning.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -36,7 +38,8 @@ if [[ ! -x "$BIN/kvnode" || ! -x "$BIN/gateway" || ! -x "$BIN/kvstore" ]]; then
 fi
 
 # Four nodes so a replica set of three can lose one and still hold a quorum.
-NODES=(127.0.0.1:7070 127.0.0.1:7071 127.0.0.1:7072 127.0.0.1:7073)
+NODES=(ktp://127.0.0.1:7170 ktp://127.0.0.1:7171 ktp://127.0.0.1:7172 ktp://127.0.0.1:7173)
+KEY="demo-$(date +%s)"
 GW_PORT=${KVSTORE_GW_PORT:-${TRIGLOT_GW_PORT:-8090}}
 GW="127.0.0.1:$GW_PORT"
 
@@ -44,19 +47,20 @@ rm -f /tmp/kvstore-node-*.db
 
 start_node() { # index
   local i="$1"
-  "$BIN/kvnode" --listen "${NODES[$i]}" --db "/tmp/kvstore-node-$i.db" --capacity 1024 \
-    >>"$TMP/node-$i.log" 2>&1 &
+  "$BIN/kvnode" --ktp "${NODES[$i]#ktp://}" --db "/tmp/kvstore-node-$i.db" --capacity 1024 \
+    --cluster-key "$KEY" >>"$TMP/node-$i.log" 2>&1 &
   PIDS[$i]=$!
 }
-idx_of() { echo $(( ${1##*:} - 7070 )); }  # 127.0.0.1:7072 -> 2
+idx_of() { echo $(( ${1##*:} - 7170 )); }  # ktp://127.0.0.1:7172 -> 2
 
-say "starting 4 kvnodes"
+say "starting 4 kvnodes (KTP: X25519 + Ed25519 handshake, AES-256-GCM, keyed to the cluster secret)"
 for i in 0 1 2 3; do start_node "$i"; done
 sleep 0.4
+grep -h "ktp on" "$TMP"/node-*.log | sed 's/^/   /'
 
 say "starting gateway on :$GW_PORT  (RF=3, R=2, W=2  ->  R+W>RF, strongly consistent)"
 "$BIN/gateway" --listen ":$GW_PORT" --nodes "$(IFS=, ; echo "${NODES[*]}")" \
-  --rf 3 --read 2 --write 2 --heartbeat 1s >"$TMP/gateway.log" 2>&1 &
+  --cluster-key "$KEY" --rf 3 --read 2 --write 2 --heartbeat 1s >"$TMP/gateway.log" 2>&1 &
 PIDS+=($!)
 sleep 0.5
 
@@ -64,6 +68,8 @@ CLI=("$BIN/kvstore" --gw "http://$GW")
 
 say "health"
 "${CLI[@]}" health
+note "every storage link is an authenticated KTP connection (from the kvnode logs):"
+grep -h "connected (peer" "$TMP"/node-*.log | sed 's/^/   /'
 
 say "writing keys (each replicated to RF=3 nodes, needs W=2 acks)"
 "${CLI[@]}" put hello      world
@@ -89,18 +95,22 @@ sleep 1.2
 note "heartbeat should mark it down; a read still succeeds from the survivors:"
 curl -si "http://$GW/kv/hello" | grep -iE '^(HTTP|X-KV-(Version|Responders))' || true
 echo
-note "and so does a write — 2 of 3 replicas is still a W=2 quorum (hint stored for the dead node):"
+note "and so does a write — 2 of 3 replicas is still a W=2 quorum. It returns once the quorum"
+note "is in; the dead replica's copy times out in the background and becomes a hint:"
 "${CLI[@]}" put hello world-v2
-"${CLI[@]}" metrics || true
+sleep 2.3
+curl -s "http://$GW/metrics" | grep -E '^kvstore_hints_(stored|replayed)_total' | sed 's/^/   /' || true
 
 say "hinted handoff + read-repair: bring $FIRST_REPLICA back (it missed the world-v2 write)"
 start_node "$VICTIM_IDX"
+note "the restarted process has no state for the gateway's old connection: its stateless"
+note "reset makes the gateway redial at once instead of waiting out an idle timeout"
 sleep 1.5
 note "heartbeat replays hints; a read returns the fresh value and may also read-repair:"
 curl -si "http://$GW/kv/hello" | grep -iE '^(HTTP|X-KV-(Version|Responders|Repaired))' || true
 echo
 "${CLI[@]}" get hello
-"${CLI[@]}" metrics || true
+curl -s "http://$GW/metrics" | grep -E '^kvstore_hints_(stored|replayed)_total' | sed 's/^/   /' || true
 
 say "scan — keys merged across nodes, with how many replicas hold each"
 "${CLI[@]}" scan
