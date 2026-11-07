@@ -494,18 +494,69 @@ type nodeRead struct {
 	err  error
 }
 
-func gatherReads(addrs []string, nodes []kv.Node, key []byte) []nodeRead {
-	out := make([]nodeRead, len(nodes))
-	var wg sync.WaitGroup
-	for i := range nodes {
-		wg.Add(1)
+// straggleGrace is how long a quorum operation that already has its quorum
+// keeps waiting for the remaining replicas. Healthy replicas answer well
+// inside it, so read-repair and acknowledgement counts still see them; an
+// unreachable one -- a crashed host, a partition, a UDP peer that vanished
+// without a word -- no longer holds every request hostage for its full
+// timeout.
+const straggleGrace = 50 * time.Millisecond
+
+// errNoAnswer marks a replica that had not answered when its quorum
+// operation returned.
+var errNoAnswer = errors.New("cluster: replica did not answer within the quorum's grace period")
+
+type outcome[T any] struct {
+	i   int
+	v   T
+	err error
+}
+
+// fanOut runs call(i) for every replica concurrently. It returns once all
+// have answered, or once need calls have succeeded and the rest have had
+// straggleGrace (or twice the time the quorum took, if longer) to catch up.
+// Late calls keep running in the background; they must do their own
+// bookkeeping (writes store hints when they fail). The result has one entry
+// per replica in order; those that had not answered carry errNoAnswer.
+func fanOut[T any](n, need int, call func(i int) (T, error)) []outcome[T] {
+	ch := make(chan outcome[T], n) // buffered: late senders never block
+	for i := 0; i < n; i++ {
 		go func(i int) {
-			defer wg.Done()
-			res, err := nodes[i].Get(key)
-			out[i] = nodeRead{addr: addrs[i], res: res, err: err}
+			v, err := call(i)
+			ch <- outcome[T]{i: i, v: v, err: err}
 		}(i)
 	}
-	wg.Wait()
+	out := make([]outcome[T], n)
+	for i := range out {
+		out[i] = outcome[T]{i: i, err: errNoAnswer}
+	}
+	start := time.Now()
+	var grace <-chan time.Time
+	for got, ok := 0, 0; got < n; got++ {
+		select {
+		case o := <-ch:
+			out[o.i] = o
+			if o.err == nil {
+				ok++
+			}
+			if grace == nil && ok >= need && got+1 < n {
+				grace = time.After(max(straggleGrace, 2*time.Since(start)))
+			}
+		case <-grace:
+			return out
+		}
+	}
+	return out
+}
+
+// gatherReads reads key from the replicas, returning once need of them have
+// answered (see fanOut).
+func gatherReads(addrs []string, nodes []kv.Node, key []byte, need int) []nodeRead {
+	res := fanOut(len(nodes), need, func(i int) (kv.ReadResult, error) { return nodes[i].Get(key) })
+	out := make([]nodeRead, len(nodes))
+	for i, o := range res {
+		out[i] = nodeRead{addr: addrs[i], res: o.v, err: o.err}
+	}
 	return out
 }
 
@@ -564,7 +615,7 @@ func (c *Cluster) Get(key []byte) (value []byte, found bool, meta ReadMeta, err 
 	defer func() { c.observeGet(time.Since(start)) }()
 	atomic.AddUint64(&c.mGets, 1)
 	addrs, nodes := c.replicas(key)
-	reads := gatherReads(addrs, nodes, key)
+	reads := gatherReads(addrs, nodes, key, c.R())
 
 	meta.Replicas = addrs
 	var best kv.ReadResult
@@ -686,7 +737,7 @@ func (c *Cluster) mintQuorum(replicaCount int) int {
 // the new write supersedes it. It also reports how many replicas answered;
 // callers must check that against peekQuorum before minting from the result.
 func (c *Cluster) peekMaxVersion(addrs []string, nodes []kv.Node, key []byte) (maxv uint64, responders int) {
-	for _, rd := range gatherReads(addrs, nodes, key) {
+	for _, rd := range gatherReads(addrs, nodes, key, c.peekQuorum(len(addrs))) {
 		if rd.err == nil {
 			responders++
 			c.clock.witness(rd.res.Version)
@@ -730,20 +781,13 @@ func (c *Cluster) putAt(key, val []byte, expiresAt uint64) (WriteMeta, error) {
 
 func (c *Cluster) broadcastPut(addrs []string, nodes []kv.Node, key, val []byte, version, expiresAt uint64) (WriteMeta, error) {
 	acks := 0
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for i := range nodes {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			if err := putOrHint(c, addrs[i], nodes[i], key, val, version, expiresAt); err == nil {
-				mu.Lock()
-				acks++
-				mu.Unlock()
-			}
-		}(i)
+	for _, o := range fanOut(len(nodes), c.W(), func(i int) (struct{}, error) {
+		return struct{}{}, putOrHint(c, addrs[i], nodes[i], key, val, version, expiresAt)
+	}) {
+		if o.err == nil {
+			acks++
+		}
 	}
-	wg.Wait()
 
 	meta := WriteMeta{Replicas: addrs, Acks: acks, Required: c.W(), Version: version}
 	if acks < c.W() {
@@ -767,24 +811,14 @@ func (c *Cluster) Del(key []byte) (existed bool, meta WriteMeta, err error) {
 
 	acks := 0
 	anyExisted := false
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for i := range nodes {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			was, err := delOrHint(c, addrs[i], nodes[i], key, version)
-			if err == nil {
-				mu.Lock()
-				acks++
-				if was {
-					anyExisted = true
-				}
-				mu.Unlock()
-			}
-		}(i)
+	for _, o := range fanOut(len(nodes), c.W(), func(i int) (bool, error) {
+		return delOrHint(c, addrs[i], nodes[i], key, version)
+	}) {
+		if o.err == nil {
+			acks++
+			anyExisted = anyExisted || o.v
+		}
 	}
-	wg.Wait()
 
 	meta = WriteMeta{Replicas: addrs, Acks: acks, Required: c.W(), Version: version}
 	if acks < c.W() {
@@ -808,7 +842,7 @@ func (c *Cluster) Mutate(key []byte, apply func(states [][]byte) ([]byte, error)
 	defer unlock()
 
 	addrs, nodes := c.replicas(key)
-	reads := gatherReads(addrs, nodes, key)
+	reads := gatherReads(addrs, nodes, key, c.mintQuorum(len(addrs)))
 
 	var states [][]byte
 	responders := 0
@@ -983,7 +1017,7 @@ func (c *Cluster) RepairSweep() (int, []string) {
 			}
 		}
 		addrs, nodes := c.replicas(key)
-		reads := gatherReads(addrs, nodes, key)
+		reads := gatherReads(addrs, nodes, key, len(nodes)) // background repair: every replica
 
 		best := kv.ReadResult{Version: row.version, ExpiresAt: row.expiresAt, Value: row.raw}
 		if row.deleted {
