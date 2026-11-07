@@ -732,3 +732,125 @@ fn initials_that_are_not_valid_hellos_are_refused() {
     seal_plain(&mut not_hello, Header::new(PacketType::Initial, [1; 8], [2; 8], 0), &vec![0; MIN_INITIAL_SIZE - 32]);
     assert!(matches!(accept(&not_hello), Err(AcceptError::NoHello)));
 }
+
+// ---- robustness: an authenticated client sending nonsense ----
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    fn bytes(&mut self, max: u64) -> Vec<u8> {
+        (0..self.below(max + 1)).map(|_| self.next() as u8).collect()
+    }
+}
+
+fn random_frame(r: &mut Rng) -> Frame {
+    let id = r.below(8); // mostly valid client streams, some server-side (odd) IDs
+    match r.below(14) {
+        0 => Frame::Ping,
+        1 | 2 => {
+            let hi = r.below(40);
+            let lo = hi.saturating_sub(r.below(5));
+            Frame::Ack(Ack { delay: r.below(100_000), ranges: vec![(lo, hi)] })
+        }
+        3..=5 => Frame::Stream { id: id & !1, offset: r.below(6000), data: r.bytes(400), fin: r.below(4) == 0 },
+        6 => Frame::ResetStream { id, code: r.below(1000), final_size: r.below(7000) },
+        7 => Frame::StopSending { id, code: r.below(1000) },
+        8 => Frame::MaxData(r.below(1 << 40)),
+        9 => Frame::MaxStreamData { id, max: r.below(1 << 30) },
+        10 => Frame::MaxStreams(r.below(1 << 20)),
+        11 => Frame::StreamDataBlocked { id, limit: r.below(1 << 20) },
+        12 => Frame::Handshake(r.bytes(120)),
+        _ => {
+            if r.below(20) == 0 {
+                Frame::ConnectionClose { code: r.below(20), reason: r.bytes(10) }
+            } else {
+                Frame::Datagram(r.bytes(50))
+            }
+        }
+    }
+}
+
+#[test]
+fn survives_random_frames_and_application_calls() {
+    // KTP_FUZZ_SEEDS=N runs N seeds (default 1, which keeps `cargo test` fast).
+    let seeds: u64 = std::env::var("KTP_FUZZ_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    for seed in 0..seeds {
+        torture(0x2545_f491_4f6c_dd1d ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    }
+}
+
+fn torture(seed: u64) {
+    let v = Vectors::load();
+    let t0 = Instant::now();
+    let mut r = Rng(seed);
+    let mut connections = 0;
+    let mut now = t0;
+    let (mut conn, mut cl) = established(&v, now);
+    let mut buf = vec![0u8; 2048];
+    for step in 0..20_000 {
+        if conn.is_closed() {
+            // Each "new" connection reuses the vector keys: fine for a
+            // single-connection state machine.
+            connections += 1;
+            now += ms(1);
+            (conn, cl) = established(&v, now);
+        }
+        match r.below(10) {
+            0..=5 => {
+                let frames: Vec<Frame> = (0..1 + r.below(4)).map(|_| random_frame(&mut r)).collect();
+                cl.send(&mut conn, &frames, now);
+            }
+            6 => {
+                // Random (sometimes nonsensical) application calls.
+                let id = r.below(8) & !1;
+                match r.below(5) {
+                    0 => {
+                        let _ = conn.stream_read(id, &mut buf);
+                    }
+                    1 => {
+                        let data = r.bytes(3000);
+                        let _ = conn.stream_write(id, &data);
+                    }
+                    2 => conn.stream_close_write(id),
+                    3 => conn.stream_reset(id, CODE_APPLICATION),
+                    _ => conn.stream_stop_sending(id, CODE_APPLICATION),
+                }
+                while conn.accept_stream().is_some() {}
+            }
+            7 => {
+                if let Some(t) = conn.timeout() {
+                    now = now.max(t.min(now + ms(r.below(200))));
+                    conn.handle_timeout(now);
+                }
+            }
+            _ => {
+                // Garbage datagrams: random bytes, truncations, bit flips.
+                let mut pkt = v.hex("pkt.c2s");
+                match r.below(3) {
+                    0 => pkt.truncate(r.below(pkt.len() as u64) as usize),
+                    1 => {
+                        let i = r.below(pkt.len() as u64) as usize;
+                        pkt[i] ^= 1 << r.below(8);
+                    }
+                    _ => pkt = r.bytes(200),
+                }
+                conn.handle_packet(&pkt, now);
+            }
+        }
+        // Whatever the server sends must be well-formed and decryptable.
+        for (h, _) in cl.recv(&mut conn, now) {
+            assert!(h.ty == PacketType::OneRtt || h.ty == PacketType::Handshake, "seed {seed:x} step {step}");
+        }
+        now += Duration::from_micros(r.below(3000));
+    }
+    assert!(connections > 10, "seed {seed:x}: the fuzzer rarely closed a connection ({connections})");
+}

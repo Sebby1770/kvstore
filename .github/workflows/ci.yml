@@ -20,5 +20,7 @@ jobs:
         run: make chaos
       - name: Fuzz smoke
         run: make fuzz-smoke FUZZTIME=5s
+      - name: Go <-> Rust KTP interop (lossy relay)
+        run: make interop
       - name: Mesh demo (real processes over UDP)
         run: make mesh-demo
