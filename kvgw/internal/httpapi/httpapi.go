@@ -26,6 +26,7 @@ import (
 	"github.com/Sebby1770/kvstore/kvgw/internal/client"
 	"github.com/Sebby1770/kvstore/kvgw/internal/cluster"
 	"github.com/Sebby1770/kvstore/kvgw/internal/crdt"
+	"github.com/Sebby1770/kvstore/kvgw/internal/kv"
 )
 
 // Membership changes the storage ring. Implementations must make the change
@@ -49,6 +50,10 @@ type Options struct {
 	TagPrefix string
 	// Brand is shown on the index page ("KVStore gateway" if empty).
 	Brand string
+	// NodeFactory builds the client for a kvnode added at runtime
+	// (client.New over TCP if nil). Gateways with a KTP endpoint pass one
+	// that understands ktp:// addresses.
+	NodeFactory func(addr string) kv.Node
 }
 
 // API serves the KV HTTP surface for one coordinator.
@@ -65,11 +70,11 @@ type API struct {
 // localMembership mutates this process's ring directly (single gateway).
 type localMembership struct {
 	cluster *cluster.Cluster
-	timeout time.Duration
+	newNode func(addr string) kv.Node
 }
 
 func (m localMembership) AddNode(addr string) error {
-	if !m.cluster.AddNode(addr, client.New(addr, m.timeout)) {
+	if !m.cluster.AddNode(addr, m.newNode(addr)) {
 		return ErrMembershipConflict
 	}
 	return nil
@@ -90,7 +95,12 @@ func New(cl *cluster.Cluster, opts Options) *API {
 		g.timeout = 2 * time.Second
 	}
 	if g.membership == nil {
-		g.membership = localMembership{cluster: cl, timeout: g.timeout}
+		newNode := opts.NodeFactory
+		if newNode == nil {
+			timeout := g.timeout
+			newNode = func(addr string) kv.Node { return client.New(addr, timeout) }
+		}
+		g.membership = localMembership{cluster: cl, newNode: newNode}
 	}
 	if g.tagPrefix == "" {
 		g.tagPrefix = "gw"

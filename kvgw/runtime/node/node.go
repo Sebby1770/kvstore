@@ -83,7 +83,7 @@ type Config struct {
 	// factory for storage-node clients.
 	PacketConn net.PacketConn
 	Resolve    func(addr string) (net.Addr, error)
-	KVNode     func(addr string) kv.Node
+	KVNode     func(addr string) kv.Node // storage-node factory (default: client.Open on the node's endpoint)
 }
 
 // Node is a running mesh node.
@@ -158,10 +158,6 @@ func (c *Config) defaults() error {
 	if c.ProbeInterval <= 0 {
 		c.ProbeInterval = time.Second
 	}
-	if c.KVNode == nil {
-		timeout := c.KVTimeout
-		c.KVNode = func(addr string) kv.Node { return client.New(addr, timeout) }
-	}
 	return nil
 }
 
@@ -228,6 +224,18 @@ func Start(cfg Config) (*Node, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	if n.cfg.KVNode == nil {
+		// Storage nodes: ktp:// ones over this node's own KTP endpoint
+		// (encrypted, keyed to the cluster secret), host:port over TCP.
+		ep, timeout := n.ep, n.cfg.KVTimeout
+		n.cfg.KVNode = func(addr string) kv.Node {
+			c, err := client.Open(addr, ep, timeout)
+			if err != nil {
+				n.logf("storage node %s: %v", addr, err)
+			}
+			return c
+		}
 	}
 
 	// RPC, with hybrid-logical-clock propagation in metadata.
