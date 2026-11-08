@@ -1,8 +1,8 @@
 [package]
 name = "kvnode"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "KVStore node — TCP server in front of a C storage engine"
+description = "KVStore storage node: a KTP (encrypted UDP) and TCP server in front of a C storage engine"
 
 [[bin]]
 name = "kvnode"

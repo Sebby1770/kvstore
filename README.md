@@ -24,9 +24,9 @@ coordinator, and any node serves any request.
    │             streams, flow control, RFC 9002 recovery, NewReno/CUBIC/BBR       │
    └───────┬──────────────────────────┬──────────────────────────┬────────────────┘
            │ KTP/UDP between kvmesh nodes (gossip, Raft, actor calls)   ▲
-           │ TCP to storage nodes                                       │ SWIM
+           │ KTP/UDP to storage nodes (kvnode runs its own KTP server)  │ SWIM
    ┌───────▼─────┐   ┌─────────────┐   ┌─────────────┐
-   │ kvnode      │   │ kvnode      │   │ kvnode      │   Rust daemon, one per disk
+   │ kvnode      │   │ kvnode      │   │ kvnode      │   Rust daemon + KTP server, one per disk
    │  └ FFI      │   │  └ FFI      │   │  └ FFI      │
    │ libkvengine │   │ libkvengine │   │ libkvengine │   C: mmap'd hash table, versioned slots
    └─────────────┘   └─────────────┘   └─────────────┘
@@ -52,7 +52,11 @@ coordinator, and any node serves any request.
 - **Virtual actors** (`runtime/actor`): activated on demand on their owner,
   turn-based, migrating with their state when nodes die, fenced by CAS.
 - The **KV store** from 1.x, now served by every node, with its ring adopted
-  from the control plane — plus the 1.x single-gateway mode, unchanged.
+  from the control plane — plus the 1.x single-gateway mode.
+- An **encrypted storage tier**: kvnode speaks KTP natively through a second,
+  independent implementation of the protocol in Rust (`kvnode/src/ktp`). Golden
+  vectors generated from the Go code pin the two together byte for byte, and an
+  interop suite drives the Rust server with the Go client over a lossy relay.
 
 The design contract is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); every
 package's `doc.go` explains its protocol.
@@ -124,15 +128,17 @@ three `kvmesh` nodes on real UDP sockets, then a fourth. Output from a real run:
 ## Running a mesh
 
 ```sh
-# storage nodes (as in 1.x)
-for i in 0 1 2; do bin/kvnode --listen 127.0.0.1:707$i --db /tmp/kv$i.db & done
+# storage nodes, serving KTP (encrypted, keyed to the same cluster secret)
+for i in 0 1 2; do
+  bin/kvnode --ktp 127.0.0.1:717$i --db /tmp/kv$i.db --identity /tmp/kv$i.key --cluster-key s3cret &
+done
 
 # three founding kvmesh nodes; every founder gets the same --bootstrap list
 BOOT=n1=127.0.0.1:7101,n2=127.0.0.1:7102,n3=127.0.0.1:7103
 for i in 1 2 3; do
   bin/kvmesh --name n$i --listen 127.0.0.1:710$i --http 127.0.0.1:810$i \
     --data /tmp/mesh-n$i --cluster-key s3cret --bootstrap $BOOT \
-    --kvnodes 127.0.0.1:7070,127.0.0.1:7071,127.0.0.1:7072 &
+    --kvnodes ktp://127.0.0.1:7170,ktp://127.0.0.1:7171,ktp://127.0.0.1:7172 &
 done
 
 # later: a node joins through any member; it becomes a learner, then a voter
@@ -226,16 +232,16 @@ clusters deterministically from a seed and replay failures exactly:
 ## Use it manually (single gateway, 1.x)
 
 ```sh
-# 4 storage nodes
+# 4 storage nodes (KTP; use --listen 127.0.0.1:707$i for plain TCP)
 for i in 0 1 2 3; do
-  bin/kvnode --listen 127.0.0.1:707$i --db /tmp/kvstore-node-$i.db --capacity 1024 &
+  bin/kvnode --ktp 127.0.0.1:717$i --db /tmp/kvstore-node-$i.db --capacity 1024 --cluster-key s3cret &
 done
 
 # gateway: replicate each key to 3 nodes, 2 acks to write, 2 responses to read.
 # --anti-entropy turns on a background repair sweep (heal without a read).
 # --heartbeat (default 2s) pings nodes and replays hints.
-bin/gateway --listen :8090 \
-  --nodes 127.0.0.1:7070,127.0.0.1:7071,127.0.0.1:7072,127.0.0.1:7073 \
+bin/gateway --listen :8090 --cluster-key s3cret \
+  --nodes ktp://127.0.0.1:7170,ktp://127.0.0.1:7171,ktp://127.0.0.1:7172,ktp://127.0.0.1:7173 \
   --rf 3 --read 2 --write 2 --anti-entropy 5s --heartbeat 2s &
 
 # drive it
@@ -502,8 +508,11 @@ is a TLA+ model of KVStore's R + W > N safety property, verified with TLC.
 
 ## Storage wire protocol (coordinator ↔ kvnode)
 
-Length-prefixed binary, big-endian, designed to be readable in `tcpdump -X`.
-Values carry an 8-byte version and an 8-byte `expires_at` (0 = never).
+Length-prefixed binary, big-endian. Values carry an 8-byte version and an
+8-byte `expires_at` (0 = never). It travels on a KTP stream to
+`ktp://host:port` (`kvnode --ktp`: encrypted and authenticated, each stream
+used like one TCP connection), or over plain TCP to `host:port`
+(`kvnode --listen`), where it is readable in `tcpdump -X`.
 
 ```
 Request   GET      : 1B op  4B klen  key
@@ -539,10 +548,10 @@ prefix (`memcmp`; empty prefix = full scan). Inserts that would return
 
 ## What it still is not
 
-- **The storage tier speaks plain TCP.** Links between kvmesh nodes are KTP
-  (encrypted, authenticated); links from a coordinator to its kvnodes are still
-  the 1.x binary protocol, unencrypted and unauthenticated. Keep kvnodes on
-  localhost or a private network. Moving kvnode onto KTP is the obvious next step.
+- **kvnode's TCP listener is plaintext.** `--ktp` storage links are encrypted
+  and keyed to the cluster secret (and can pin coordinator identities with
+  `--allow-peer`); `--listen` keeps the 1.x unauthenticated TCP protocol for
+  old coordinators and localhost setups. Don't expose it.
 - **The HTTP API has no authentication** (as in 1.x): anyone who can reach a
   node's HTTP port can write keys, take leases, change the ring or transfer
   Raft leadership. Bind `--http` to localhost or a private network, or put it
@@ -576,7 +585,7 @@ await kv.put('hello', 'world');
 
 ```
 kvengine/             C — storage engine (libkvengine.a), v3 + CRC + TTL + rehash
-kvnode/               Rust — TCP server + FFI
+kvnode/               Rust — KTP server (second implementation of the protocol) + TCP + FFI
 kvgw/                 Go module (standard library only)
   netstack/wire       KTP packet + frame codec, varints, CRC32C
   netstack/ktp        KTP transport (sans-IO): handshake, streams, recovery, NewReno/CUBIC/BBR
@@ -596,6 +605,7 @@ kvgw/                 Go module (standard library only)
   cmd/ktpcat          KTP netcat / benchmark / simulator
   cmd/gateway         1.x single-process gateway
   cmd/kvstore         CLI
+  interop/            Go KTP client vs the real Rust kvnode, over a lossy relay
 clients/              tiny JS HTTP client (no deps)
 docs/                 ARCHITECTURE.md, screenshots
 scripts/              demo.sh (1.x), mesh-demo.sh (2.0)
