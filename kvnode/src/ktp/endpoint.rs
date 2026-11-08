@@ -431,7 +431,12 @@ impl Read for KtpStream {
                     }
                     st = inner.app_cv.wait(st).unwrap_or_else(|e| e.into_inner());
                 }
-                Err(StreamError::Unknown) => return Err(closed_err(ErrorKind::ConnectionAborted, "stream closed")),
+                Err(StreamError::Unknown) => {
+                    // Retired: both halves finished, so everything the client
+                    // sent has been read (as in Go, that is a clean EOF).
+                    self.h.eof.store(true, Ordering::Relaxed);
+                    return Ok(0);
+                }
                 Err(e) => return Err(closed_err(ErrorKind::Other, &format!("{e:?}"))),
             }
         }
