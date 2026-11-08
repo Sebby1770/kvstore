@@ -192,6 +192,7 @@ type Conn struct {
 
 	// timers / accounting
 	lastRecv, lastAckElicitSent, lastSend time.Time
+	elicitedSinceRecv                     bool // an ack-eliciting packet went out since lastRecv
 	pingQueued                            bool
 	bytesSent, bytesRecv                  uint64
 	pktsSent, pktsRecv, pktsDropped       uint64

@@ -32,7 +32,7 @@ func (c *Cluster) cas(key []byte, expectedVersion uint64, val []byte, expiresAt 
 	defer unlock()
 
 	addrs, nodes := c.replicas(key)
-	reads := gatherReads(addrs, nodes, key)
+	reads := gatherReads(addrs, nodes, key, c.mintQuorum(len(addrs)))
 
 	var best kv.ReadResult
 	haveBest := false

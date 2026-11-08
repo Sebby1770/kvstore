@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # KVStore 2 mesh demo: three storage nodes (Rust + C) and three kvmesh nodes
 # (Go: KTP transport, SWIM, Raft control plane, virtual actors, KV
-# coordinator) on real UDP sockets. Proves: any node serves any request,
+# coordinator) on real UDP sockets. Every link is KTP -- mesh to mesh in Go,
+# mesh to storage served by kvnode's own Rust implementation of the protocol. Proves: any node serves any request,
 # leases with fencing tokens, job queues, actors that migrate with their
 # state, control-plane failover after kill -9, and a fourth node joining
 # live. Self-cleaning.
@@ -40,12 +41,13 @@ for b in kvnode kvmesh kvstore; do
   [[ -x "$BIN/$b" ]] || { echo "bin/$b missing — run 'make all' first" >&2; exit 1; }
 done
 
-say "storage tier: 3 kvnodes (Rust daemon + C engine)"
+say "storage tier: 3 kvnodes (Rust daemon + C engine) serving KTP: encrypted, authenticated UDP"
 KV=""
 for i in 0 1 2; do
-  "$BIN/kvnode" --listen "127.0.0.1:717$i" --db "$TMP/kv$i.db" --capacity 1024 >"$TMP/kvnode$i.log" 2>&1 &
+  "$BIN/kvnode" --ktp "127.0.0.1:717$i" --db "$TMP/kv$i.db" --capacity 1024 \
+    --identity "$TMP/kv$i.key" --cluster-key "$KEY" >"$TMP/kvnode$i.log" 2>&1 &
   PIDS+=($!)
-  KV="${KV:+$KV,}127.0.0.1:717$i"
+  KV="${KV:+$KV,}ktp://127.0.0.1:717$i"
 done
 note "$KV"
 
@@ -101,7 +103,11 @@ owner=$(curl -s -X POST --data-binary 'get' http://127.0.0.1:8201/actor/counter/
 
 say "transport: KTP connections from n1"
 status 1 | json "'\n'.join('   %s %-4s srtt %.2fms  cwnd %dKiB  sent %d  lost %d  (%s)' % ('->' if t['client'] else '<-', t['peer'], t['srtt_ms'], t['cwnd']//1024, t['packets_sent'], t['packets_lost'], t['congestion']) for t in d['transport'])"
-note "one encrypted KTP connection per peer pair, reused in both directions"
+note "one encrypted KTP connection per peer pair, reused in both directions; the"
+note "storage nodes' side of the same story (each authenticated every coordinator):"
+for i in 0 1 2; do
+  printf "   kv%s: %s coordinators connected\n" "$i" "$(grep -c 'connected (peer' "$TMP/kvnode$i.log" || true)"
+done
 
 leader=$(status 1 | json "d['raft']['leader']")
 oldterm=$(status 1 | json "d['raft']['term']")

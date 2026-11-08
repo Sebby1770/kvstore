@@ -313,8 +313,12 @@ func (c *Conn) finish(buf []byte, pt wire.PacketType, payload []byte, frames []s
 	c.bytesSent += uint64(n)
 	c.pktsSent++
 	c.lastSend = now
-	if eliciting {
+	if eliciting && !c.elicitedSinceRecv {
+		// RFC 9000 §10.1: only the first ack-eliciting packet after a
+		// receive restarts the idle timer, so PTO probes and keep-alive
+		// pings cannot keep a connection to a vanished peer alive forever.
 		c.lastAckElicitSent = now
+		c.elicitedSinceRecv = true
 	}
 	return n
 }

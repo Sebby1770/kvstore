@@ -24,7 +24,7 @@ Go tier into two reusable layers and rebuilds the store on top of them:
    │   wire     packet + frame codec, varints, CRC32C                                                │
    │   simnet   in-memory packet network: latency, jitter, loss, dup, reorder, corrupt, partitions    │
    └───────────────────────────────────────────────────────────────────────────────────────────────┘
-                 UDP (or simnet)  ·  storage tier: kvnode (Rust) + kvengine (C) over the 1.x TCP protocol
+                 UDP (or simnet)  ·  storage tier: kvnode (Rust, its own KTP server) + kvengine (C)
 ```
 
 Import paths are `github.com/Sebby1770/kvstore/kvgw/netstack/<pkg>` and
@@ -316,6 +316,33 @@ datagrams, Raft + control plane over RPC, an actor host, and the KV gateway
 any request — no single gateway — and the HTTP API adds `/mesh/*`, `/lease/*`,
 `/jobs/*`, `/actor/*` next to the 1.x KV routes.
 
+## The storage tier over KTP (kvnode/src/ktp)
+
+kvnode serves the coordinators over KTP with a second, independent
+implementation of the protocol in Rust: server side only (it accepts
+connections and serves client-opened streams; it never dials, opens streams,
+sends datagrams or gossips). The same rules apply: `ktp/conn.rs` is a sans-IO
+state machine (handshake, AES-256-GCM, ACK ranges, RFC 9002 recovery with
+NewReno, stream and connection flow control, anti-amplification, stateless
+resets, idle timeout, close/drain), and `ktp/endpoint.rs` drives it with a
+receive thread and a timer thread, handing out blocking `Read + Write` stream
+handles. Each stream runs the unchanged 1.x request handler, exactly as a TCP
+connection did. Coordinators address such nodes as `ktp://host:port`; a
+`kvmesh` node uses its own endpoint, so storage links share the mesh's
+identity and cluster key.
+
+Two implementations stay compatible through tests, not hope:
+
+* `kvgw/netstack/ktp/vectors_test.go` derives the codec, key schedule,
+  handshake messages, packet protection and stateless resets from fixed keys
+  into `kvnode/tests/ktp_vectors.txt`; the Go test fails if Go drifts from the
+  file, `cargo test` if Rust does. The Rust tests also run the server through a
+  handshake that must reproduce Go's SERVER_HELLO byte for byte.
+* `kvgw/interop` (`make interop`) runs the real kvnode binary under the Go
+  client: every op, 10% loss each way through a seeded relay, a wrong cluster
+  key, kill -9 + restart healed by stateless reset, concurrency, identity
+  pinning (`kvnode --allow-peer`).
+
 ## Deterministic simulation (where it lives)
 
 The plan was a separate `runtime/sim` package; in the end each sans-IO core
@@ -354,3 +381,9 @@ full-size suites and CI runs them on every push.
 * Raft writes the founding membership into the log as committed conf-change
   entries (identical on every founder), so a node added later learns the full
   membership by replication instead of believing it is alone.
+* (2.1) The storage tier moved onto KTP (above). Porting the protocol found
+  that Go's plaintext `open` could slice out of range on a header-only
+  datagram whose bytes happened to form a valid CRC (fixed, regression-tested),
+  and that quorum operations waited for every replica, so an unreachable
+  one stalled each phase by its full timeout; they now return once the quorum
+  is in and give stragglers a short grace period.

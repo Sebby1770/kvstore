@@ -1,50 +1,141 @@
-// kvnode — accepts TCP connections from the Go gateway and dispatches into
-// the C storage engine. Thread-per-connection with a single mutex guarding
-// the (non-thread-safe) C handle. Honest and easy to reason about.
+// kvnode — the storage tier: serves the Go coordinators' requests from the C
+// storage engine. Thread-per-connection with a single mutex guarding the
+// (non-thread-safe) C handle. Honest and easy to reason about.
 //
-// The node is deliberately dumb: it stores whatever version the gateway tells
-// it (the engine enforces last-writer-wins and native TTL) and reports versions
-// back. All the distributed-systems policy — replication, quorum, read-repair,
-// hinted handoff — lives in the gateway, not here.
+// Two transports carry the same request protocol (proto.rs):
+//   --ktp ADDR     KTP over UDP: encrypted (AES-256-GCM), authenticated
+//                  (Ed25519 identities, keys bound to the cluster secret) and
+//                  loss-tolerant; every stream a coordinator opens is served
+//                  exactly like a TCP connection. This is the mode to use.
+//   --listen ADDR  plain TCP, for localhost setups and old coordinators.
+//
+// The node is deliberately dumb: it stores whatever version the coordinator
+// tells it (the engine enforces last-writer-wins and native TTL) and reports
+// versions back. All the distributed-systems policy — replication, quorum,
+// read-repair, hinted handoff — lives in the coordinators, not here.
 
 mod ffi;
+mod ktp;
 mod proto;
 
-use std::io::{self, BufReader, BufWriter, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+use ed25519_dalek::SigningKey;
 
 use ffi::{Db, DbErr, Got};
 use proto::*;
 
+/// Concurrent KTP streams served; further streams are refused at once.
+const MAX_KTP_HANDLERS: usize = 1024;
+
+const USAGE: &str = "usage: kvnode [--ktp ADDR] [--listen ADDR] [--db FILE] [--capacity N]
+              [--identity FILE] [--cluster-key KEY] [--allow-peer HEX]...
+
+  --ktp ADDR         serve KTP (encrypted, authenticated UDP) on ADDR, e.g. 127.0.0.1:7170
+  --listen ADDR      serve plain TCP on ADDR (default 127.0.0.1:7070 when --ktp is not given)
+  --db FILE          database file (default kvnode.db)
+  --capacity N       slots in the engine's table (default 1024)
+  --identity FILE    Ed25519 identity seed (hex); created if missing (default: a fresh key per run)
+  --cluster-key KEY  cluster secret shared with the coordinators
+                     (default $KVNODE_CLUSTER_KEY, then $KVMESH_CLUSTER_KEY)
+  --allow-peer HEX   accept only coordinators with this Ed25519 public key (repeatable)";
+
 struct Args {
-    listen:   String,
-    db_path:  PathBuf,
-    capacity: u32,
+    listen:      Option<String>,
+    ktp:         Option<String>,
+    db_path:     PathBuf,
+    capacity:    u32,
+    identity:    Option<PathBuf>,
+    cluster_key: String,
+    allow_peers: Vec<[u8; 32]>,
+}
+
+fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn to_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut listen   = "127.0.0.1:7070".to_string();
+    let mut listen   = None;
+    let mut ktp      = None;
     let mut db_path  = PathBuf::from("kvnode.db");
     let mut capacity = 1024u32;
+    let mut identity = None;
+    let mut cluster_key = std::env::var("KVNODE_CLUSTER_KEY")
+        .or_else(|_| std::env::var("KVMESH_CLUSTER_KEY"))
+        .unwrap_or_default();
+    let mut allow_peers = Vec::new();
 
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
-            "--listen"   => listen   = iter.next().ok_or("--listen needs a value")?,
+            "--listen"   => listen   = Some(iter.next().ok_or("--listen needs a value")?),
+            "--ktp"      => ktp      = Some(iter.next().ok_or("--ktp needs a value")?),
             "--db"       => db_path  = PathBuf::from(iter.next().ok_or("--db needs a value")?),
             "--capacity" => capacity = iter.next().ok_or("--capacity needs a value")?
                 .parse().map_err(|_| "--capacity must be u32")?,
+            "--identity" => identity = Some(PathBuf::from(iter.next().ok_or("--identity needs a value")?)),
+            "--cluster-key" => cluster_key = iter.next().ok_or("--cluster-key needs a value")?,
+            "--allow-peer" => {
+                let v = iter.next().ok_or("--allow-peer needs a value")?;
+                allow_peers.push(parse_hex32(&v).ok_or("--allow-peer takes a 64-hex-digit Ed25519 public key")?);
+            }
             "-h" | "--help" => {
-                eprintln!("kvnode --listen 127.0.0.1:7070 --db kvnode.db --capacity 1024");
+                eprintln!("{USAGE}");
                 std::process::exit(0);
             }
-            other => return Err(format!("unknown arg: {other}")),
+            other => return Err(format!("unknown arg: {other}\n{USAGE}")),
         }
     }
-    Ok(Args { listen, db_path, capacity })
+    if listen.is_none() && ktp.is_none() {
+        listen = Some("127.0.0.1:7070".to_string());
+    }
+    Ok(Args { listen, ktp, db_path, capacity, identity, cluster_key, allow_peers })
+}
+
+/// Loads the identity seed at path, creating it (mode 0600) if missing.
+fn load_identity(path: &Path) -> io::Result<SigningKey> {
+    match fs::read_to_string(path) {
+        Ok(text) => parse_hex32(&text)
+            .map(|seed| SigningKey::from_bytes(&seed))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "identity file must hold a 64-hex-digit seed")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let key = ktp::crypto::generate_identity();
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(path)?;
+            writeln!(f, "{}", to_hex(&key.to_bytes()))?;
+            Ok(key)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn die(msg: String) -> ! {
+    eprintln!("kvnode: {msg}");
+    std::process::exit(1);
 }
 
 fn main() {
@@ -55,18 +146,52 @@ fn main() {
 
     let db = match Db::open(&args.db_path, args.capacity) {
         Ok(d) => d,
-        Err(e) => { eprintln!("kvnode: open {:?}: {:?}", args.db_path, e); std::process::exit(1); }
+        Err(e) => die(format!("open {:?}: {:?}", args.db_path, e)),
     };
     eprintln!(
         "kvnode: db {} (count={}, capacity={}, tombstones={}, max_version={})",
         args.db_path.display(), db.count(), db.capacity(), db.tombstones(), db.max_version()
     );
-
     let db = Arc::new(Mutex::new(db));
-    let listener = TcpListener::bind(&args.listen)
-        .unwrap_or_else(|e| { eprintln!("kvnode: bind {}: {e}", args.listen); std::process::exit(1); });
-    eprintln!("kvnode: listening on {}", args.listen);
+    let mut servers = Vec::new();
 
+    if let Some(addr) = &args.ktp {
+        let identity = match &args.identity {
+            Some(p) => load_identity(p).unwrap_or_else(|e| die(format!("identity {}: {e}", p.display()))),
+            None => ktp::crypto::generate_identity(),
+        };
+        let public = identity.verifying_key().to_bytes();
+        let mut cfg = ktp::Config::new(identity, args.cluster_key.clone().into_bytes());
+        if !args.allow_peers.is_empty() {
+            cfg.allowed_peers = Some(args.allow_peers.clone());
+        }
+        let ep = ktp::Endpoint::bind(addr, cfg, true).unwrap_or_else(|e| die(format!("bind ktp {addr}: {e}")));
+        eprintln!(
+            "kvnode: ktp on {} (identity {}, fingerprint {})",
+            ep.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| addr.clone()),
+            to_hex(&public),
+            ktp::fingerprint(&public)
+        );
+        if args.cluster_key.is_empty() {
+            eprintln!("kvnode: warning: no --cluster-key; any KTP client can connect (traffic is still encrypted)");
+        }
+        let db = Arc::clone(&db);
+        servers.push(thread::spawn(move || serve_ktp(ep, db)));
+    }
+
+    if let Some(addr) = &args.listen {
+        let listener = TcpListener::bind(addr).unwrap_or_else(|e| die(format!("bind {addr}: {e}")));
+        eprintln!("kvnode: tcp on {addr} (plaintext)");
+        let db = Arc::clone(&db);
+        servers.push(thread::spawn(move || serve_tcp(listener, db)));
+    }
+
+    for s in servers {
+        let _ = s.join();
+    }
+}
+
+fn serve_tcp(listener: TcpListener, db: Arc<Mutex<Db>>) {
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -74,10 +199,39 @@ fn main() {
         };
         let db = Arc::clone(&db);
         thread::spawn(move || {
-            if let Err(e) = handle(stream, db) {
+            stream.set_nodelay(true).ok();
+            let result = stream.try_clone().and_then(|r| handle(r, stream, &db));
+            if let Err(e) = result {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
-                    eprintln!("kvnode: conn: {e}");
+                    eprintln!("kvnode: tcp conn: {e}");
                 }
+            }
+        });
+    }
+}
+
+fn serve_ktp(ep: ktp::Endpoint, db: Arc<Mutex<Db>>) {
+    let active = Arc::new(AtomicUsize::new(0));
+    loop {
+        let stream = match ep.accept() {
+            Ok(s) => s,
+            Err(e) => { eprintln!("kvnode: ktp accept: {e}"); return; }
+        };
+        if active.fetch_add(1, Ordering::SeqCst) >= MAX_KTP_HANDLERS {
+            active.fetch_sub(1, Ordering::SeqCst);
+            eprintln!("kvnode: ktp: refusing a stream from {}: {MAX_KTP_HANDLERS} already open", stream.peer_addr());
+            continue; // dropping the stream finishes it at once
+        }
+        let db = Arc::clone(&db);
+        let active = Arc::clone(&active);
+        thread::spawn(move || {
+            let peer = stream.peer_addr();
+            let result = stream.try_clone().and_then(|r| handle(r, stream, &db));
+            active.fetch_sub(1, Ordering::SeqCst);
+            match result {
+                Err(e) if e.kind() != io::ErrorKind::UnexpectedEof
+                    && e.kind() != io::ErrorKind::ConnectionAborted => eprintln!("kvnode: ktp stream from {peer}: {e}"),
+                _ => {}
             }
         });
     }
@@ -95,10 +249,11 @@ fn write_scan_row<W: Write>(w: &mut W, row: &ffi::ScanRow, with_tomb: bool) -> i
     write_bytes(w, &row.value)
 }
 
-fn handle(stream: std::net::TcpStream, db: Arc<Mutex<Db>>) -> io::Result<()> {
-    stream.set_nodelay(true).ok();
-    let mut r = BufReader::new(stream.try_clone()?);
-    let mut w = BufWriter::new(stream);
+/// Serves requests until the peer closes its side. r and w are the two
+/// directions of one TCP connection or KTP stream.
+fn handle<R: Read, W: Write>(r: R, w: W, db: &Mutex<Db>) -> io::Result<()> {
+    let mut r = BufReader::new(r);
+    let mut w = BufWriter::new(w);
 
     loop {
         let op = match read_u8(&mut r) {

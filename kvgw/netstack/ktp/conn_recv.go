@@ -126,6 +126,7 @@ func (c *Conn) HandlePacket(pkt []byte, now time.Time) error {
 	c.acks.record(now, h.PacketNumber, ackEliciting)
 	c.pktsRecv++
 	c.lastRecv = now
+	c.elicitedSinceRecv = false
 	return nil
 }
 

@@ -1,4 +1,4 @@
-.PHONY: all engine engine-test node gw bin clean demo mesh-demo test test-race fuzz-smoke chaos fmt
+.PHONY: all engine engine-test node gw bin clean demo mesh-demo test test-race fuzz-smoke chaos interop fmt
 # Docker: `docker compose up --build` (Linux; see README). Native macOS cluster: `make demo`.
 
 ROOT      := $(abspath .)
@@ -52,6 +52,11 @@ fuzz-smoke:
 # across the loss matrix, actors and the whole mesh on simnet.
 chaos:
 	cd kvgw && go test -count=1 ./runtime/... ./netstack/...
+
+# Go <-> Rust: the Go KTP stack and storage client against the real Rust
+# kvnode (its own KTP implementation), over UDP and through a lossy relay.
+interop: node
+	cd kvgw && KVNODE_BIN=$(BIN)/kvnode go test -count=1 -v ./interop
 
 demo: all
 	./scripts/demo.sh
