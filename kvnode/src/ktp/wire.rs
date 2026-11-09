@@ -196,6 +196,9 @@ pub const T_STREAM_DATA_BLOCKED: u64 = 0x15;
 pub const T_CONNECTION_CLOSE: u64 = 0x1c;
 pub const T_HANDSHAKE_DONE: u64 = 0x1e;
 pub const T_DATAGRAM: u64 = 0x30;
+pub const T_APP_PRESSURE: u64 = 0x31;
+/// The largest APP_PRESSURE load (permille).
+pub const MAX_LOAD: u64 = 1000;
 
 /// Acknowledged packet numbers: inclusive (smallest, largest) ranges,
 /// largest first, neither overlapping nor touching. `delay` is how long (µs)
@@ -250,6 +253,10 @@ pub enum Frame {
     ConnectionClose { code: u64, reason: Vec<u8> },
     HandshakeDone,
     Datagram(Vec<u8>),
+    /// Application backpressure (Go's wire.AppPressure). kvnode never sends
+    /// it and ignores it; it parses it so that a peer that does send one is
+    /// not mistaken for a protocol violator. `stream` is the stream scope.
+    AppPressure { stream: Option<u64>, seq: u64, credits: u64, load: u64, queue: u64 },
 }
 
 /// The encoded size of a STREAM frame minus its data.
@@ -326,6 +333,20 @@ impl Frame {
                 put_varint(b, d.len() as u64);
                 b.extend_from_slice(d);
             }
+            Frame::AppPressure { stream, seq, credits, load, queue } => {
+                b.push(T_APP_PRESSURE as u8);
+                match stream {
+                    Some(id) => {
+                        b.push(1);
+                        put_varint(b, *id);
+                    }
+                    None => b.push(0),
+                }
+                put_varint(b, *seq);
+                put_varint(b, *credits);
+                put_varint(b, *load);
+                put_varint(b, *queue);
+            }
         }
     }
 
@@ -339,6 +360,13 @@ impl Frame {
                 1 + varint_len(*id) + varint_len(*code) + varint_len(*final_size)
             }
             Frame::StopSending { id, code } => 1 + varint_len(*id) + varint_len(*code),
+            Frame::AppPressure { stream, seq, credits, load, queue } => {
+                2 + stream.map_or(0, varint_len)
+                    + varint_len(*seq)
+                    + varint_len(*credits)
+                    + varint_len(*load)
+                    + varint_len(*queue)
+            }
             Frame::MaxData(v) | Frame::MaxStreams(v) | Frame::DataBlocked(v) => 1 + varint_len(*v),
             Frame::MaxStreamData { id, max: v } | Frame::StreamDataBlocked { id, limit: v } => {
                 1 + varint_len(*id) + varint_len(*v)
@@ -440,6 +468,22 @@ impl<'a> Parser<'a> {
             T_DATAGRAM => {
                 let n = self.varint();
                 Frame::Datagram(self.bytes(n).to_vec())
+            }
+            T_APP_PRESSURE => {
+                let flags = self.bytes(1).first().copied();
+                let stream = match flags {
+                    Some(0) => None,
+                    Some(1) => Some(self.varint()),
+                    _ => {
+                        self.err = true;
+                        None
+                    }
+                };
+                let (seq, credits, load, queue) = (self.varint(), self.varint(), self.varint(), self.varint());
+                if load > MAX_LOAD {
+                    self.err = true;
+                }
+                Frame::AppPressure { stream, seq, credits, load, queue }
             }
             _ => {
                 if self.err {

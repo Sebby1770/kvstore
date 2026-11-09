@@ -156,6 +156,7 @@ func (c *Conn) pollOneRTT(buf []byte, now time.Time, maxSize int) int {
 				s.needMax = false
 			}
 		}
+		c.pollPressure(add)
 		for len(c.dgOut) > 0 {
 			d := wire.Datagram{Data: c.dgOut[0]}
 			if !add(d, sentFrame{}) {
@@ -281,7 +282,7 @@ func (c *Conn) pacingRate() float64 {
 }
 
 func (c *Conn) hasPendingWork() bool {
-	if len(c.ctrl) > 0 || len(c.dgOut) > 0 || c.needMaxData || c.needMaxStreams || c.pingQueued {
+	if len(c.ctrl) > 0 || len(c.dgOut) > 0 || c.needMaxData || c.needMaxStreams || c.pingQueued || len(c.press.queue) > 0 {
 		return true
 	}
 	credit := c.sendMaxData - c.sentData
