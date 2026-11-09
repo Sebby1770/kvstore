@@ -88,6 +88,9 @@ type Endpoint struct {
 	hmu        sync.RWMutex
 	dgHandlers [256]DatagramHandler
 	rawHandler [256]RawHandler
+	filter     PacketFilter
+	trustEncap map[string]bool
+	fstats     FilterStats
 	wake       chan struct{}
 	done       chan struct{}
 	wg         sync.WaitGroup
@@ -200,7 +203,10 @@ func (e *Endpoint) readLoop() {
 			e.logf("endpoint: read: %v", err)
 			continue
 		}
-		e.handleDatagram(append([]byte(nil), buf[:n]...), addr)
+		pkt := append([]byte(nil), buf[:n]...)
+		if pkt, addr = e.ingress(pkt, addr); pkt != nil {
+			e.handleDatagram(pkt, addr)
+		}
 	}
 }
 
@@ -327,7 +333,7 @@ func (e *Endpoint) resetLocked(h wire.Header, to net.Addr, now time.Time) {
 	}
 	e.resets++
 	e.stats.ResetsSent++
-	e.pc.WriteTo(ktp.StatelessReset(e.cfg, h), to)
+	e.write(ktp.StatelessReset(e.cfg, h), to)
 }
 
 // flushLocked sends everything c has queued, processes its events, wakes its
@@ -345,7 +351,7 @@ func (e *Endpoint) flushOnceLocked(c *Conn) (again bool) {
 		if n == 0 {
 			break
 		}
-		if _, err := e.pc.WriteTo(e.buf[:n], c.addr); err != nil {
+		if _, err := e.write(e.buf[:n], c.addr); err != nil {
 			e.logf("endpoint: write to %s: %v", c.addrStr, err)
 		}
 	}
@@ -509,7 +515,7 @@ func (e *Endpoint) SendRaw(addr string, payload []byte) error {
 	e.mu.Lock()
 	e.stats.RawOut++
 	e.mu.Unlock()
-	_, err = e.pc.WriteTo(pkt, a)
+	_, err = e.write(pkt, a)
 	return err
 }
 
