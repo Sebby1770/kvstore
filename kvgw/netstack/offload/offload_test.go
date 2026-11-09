@@ -214,6 +214,21 @@ func TestRateLimiter(t *testing.T) {
 	if at(time.Minute, 1, initial) != XDPDrop {
 		t.Fatal("bucket refilled past its burst")
 	}
+	// Members are exempt.
+	rl.Exempt([]string{"member:7000"})
+	member := PeerKeyString("member:7000")
+	for i := 0; i < 10; i++ {
+		if at(time.Minute, member, initial) != XDPPass {
+			t.Fatal("an exempt member was metered")
+		}
+	}
+	rl.Exempt(nil)
+	for i := 0; i < 3; i++ {
+		at(time.Minute, member, initial)
+	}
+	if at(time.Minute, member, initial) != XDPDrop {
+		t.Fatal("a removed exemption still applies")
+	}
 	// The control plane resizes the per-node share as the cluster changes.
 	rl.SetRate(Share(100, 3), 3)
 	if r, _ := rl.Rate(); r != 34 {

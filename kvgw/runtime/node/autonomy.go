@@ -99,7 +99,8 @@ func (n *Node) setupAutonomy() error {
 	a.hb = hb
 	a.hook.AttachIngress(hb.Prog)
 	if n.cfg.RateLimit > 0 {
-		if a.limiter, err = offload.NewRateLimiter(n.cfg.RateLimit, max(n.cfg.RateLimit/4, 16)); err != nil {
+		share := offload.Share(n.cfg.RateLimit, 1)
+		if a.limiter, err = offload.NewRateLimiter(share, max(share/4, 16)); err != nil {
 			return err
 		}
 		a.hook.AttachIngress(a.limiter.Prog)
@@ -230,10 +231,18 @@ func (a *autonomy) loop() {
 			a.gossipRound(peers, load, uint64(adm.Queued))
 			a.bootstrapCRDT(peers)
 			if a.limiter != nil {
+				// The budget is per source across the whole cluster; each
+				// node enforces its share, resized as membership changes.
+				// Members themselves are exempt: floods come from outside.
 				r, _ := a.limiter.Rate()
-				if share := offload.Share(n.cfg.RateLimit*uint64(len(peers)+1), len(peers)+1); share != r {
+				if share := offload.Share(n.cfg.RateLimit, len(peers)+1); share != r {
 					a.limiter.SetRate(share, max(share/4, 16))
 				}
+				var addrs []string
+				for _, m := range peers {
+					addrs = append(addrs, m.Addr)
+				}
+				a.limiter.Exempt(addrs)
 			}
 		}
 	}
@@ -397,9 +406,12 @@ func (a *autonomy) maybeHandOver() {
 	if time.Since(a.lastTransfer) < 10*n.cfg.ProbeInterval {
 		return
 	}
+	// Judge only voters the rest of the cluster still considers alive: a
+	// dead or suspected peer's bad link says nothing about *our* network.
+	// And it takes at least two of them -- one bad link proves nothing.
 	var others []string
 	for _, v := range st.Voters {
-		if v != n.cfg.Name {
+		if m, ok := n.members.get(v); v != n.cfg.Name && ok && m.State == swim.StateAlive {
 			others = append(others, v)
 		}
 	}
@@ -571,6 +583,16 @@ func (n *Node) SpecGet(ctx context.Context, key []byte) (speculate.Outcome, erro
 		cands = append(cands, m.Addr)
 	}
 	return a.spec.Do(ctx, cands, func(ctx context.Context, addr string) ([]byte, error) {
+		if addr == n.cfg.Advertise { // this node's own coordinator: no network hop
+			v, found, _, err := n.kv.Get(key)
+			switch {
+			case err != nil:
+				return nil, rpc.Errorf(rpc.Unavailable, "%v", err)
+			case !found:
+				return nil, rpc.Errorf(rpc.NotFound, "no such key")
+			}
+			return v, nil
+		}
 		return n.rpcCli.Call(ctx, addr, "spec.kv.get", key, rpc.Idempotent())
 	})
 }

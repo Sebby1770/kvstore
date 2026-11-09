@@ -70,7 +70,7 @@ func (v *memberView) setAvoid(avoid map[string]bool) bool {
 	v.avoid = avoid
 	last := v.last
 	v.mu.Unlock()
-	if same {
+	if same || last == nil {
 		return false
 	}
 	v.set(last)

@@ -81,7 +81,7 @@ type Config struct {
 	Logf func(format string, args ...any)
 
 	// Autonomy (see autonomy.go).
-	RateLimit      uint64 // per-peer budget for new connections + gossip, packets/s, enforced in the data path (0 = off)
+	RateLimit      uint64 // cluster-wide budget per non-member source for connection attempts + gossip, packets/s, enforced in the data path (0 = off)
 	CircuitBreaker bool   // shed traffic to peers that keep failing, in the data path
 	RPCConcurrency int    // RPC handler slots, advertised to callers as backpressure [512; <0 = unlimited]
 	RPCQueue       int    // RPC calls that may wait for a slot [4096]

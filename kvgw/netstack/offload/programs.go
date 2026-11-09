@@ -38,6 +38,7 @@ type RateLimiter struct {
 	Prog    *Loaded
 	config  *ArrayMap // [0] rate per second, [8] burst, [16] type mask
 	buckets *HashMap  // peer key -> [0] milli-tokens, [8] last refill ns
+	exempt  *HashMap  // peer key -> 1: never metered (cluster members)
 }
 
 // Packet types (wire.PacketType values) a RateLimiter meters by default.
@@ -51,7 +52,8 @@ const (
 // to meter (default Initial and Raw); rate is packets per second per peer,
 // burst the bucket depth (at least 1).
 func NewRateLimiter(rate, burst uint64, types ...int) (*RateLimiter, error) {
-	rl := &RateLimiter{config: NewArrayMap("rl_config", 24, 1), buckets: NewHashMap("rl_buckets", 8, 16, 65536, true)}
+	rl := &RateLimiter{config: NewArrayMap("rl_config", 24, 1), buckets: NewHashMap("rl_buckets", 8, 16, 65536, true),
+		exempt: NewHashMap("rl_exempt", 8, 8, 4096, false)}
 	if len(types) == 0 {
 		types = []int{typeInitial, typeRaw}
 	}
@@ -72,9 +74,12 @@ func NewRateLimiter(rate, burst uint64, types ...int) (*RateLimiter, error) {
 		MovReg(R8, R0).
 		Load(DW, R1, R8, 16).ALU64Reg(Rsh, R1, R7).ALU64Imm(And, R1, 1).
 		JumpImm(Jeq, R1, 0, "pass")
-	// this peer's bucket
+	// exempt sources (cluster members) pass
 	b.Load(DW, R1, R6, CtxSrcHash).Store(DW, R10, -16, R1).
-		LoadMap(R1, 1).MovReg(R2, R10).ALU64Imm(Add, R2, -16).Call(HelperMapLookup).
+		LoadMap(R1, 2).MovReg(R2, R10).ALU64Imm(Add, R2, -16).Call(HelperMapLookup).
+		JumpImm(Jne, R0, 0, "pass")
+	// this peer's bucket
+	b.LoadMap(R1, 1).MovReg(R2, R10).ALU64Imm(Add, R2, -16).Call(HelperMapLookup).
 		Load(DW, R9, R6, CtxNow).
 		JumpImm(Jne, R0, 0, "have")
 	// first packet from this peer: a full bucket, minus this packet
@@ -108,8 +113,26 @@ func NewRateLimiter(rate, burst uint64, types ...int) (*RateLimiter, error) {
 	if err != nil {
 		return nil, err
 	}
-	rl.Prog, err = Load(&Program{Name: "rate_limiter", Insns: insns, Maps: []Map{rl.config, rl.buckets}})
+	rl.Prog, err = Load(&Program{Name: "rate_limiter", Insns: insns, Maps: []Map{rl.config, rl.buckets, rl.exempt}})
 	return rl, err
+}
+
+// Exempt replaces the set of addresses that are never metered.
+func (rl *RateLimiter) Exempt(addrs []string) {
+	rl.exempt.mu.Lock()
+	defer rl.exempt.mu.Unlock()
+	want := map[string]bool{}
+	for _, a := range addrs {
+		want[string(U64(PeerKeyString(a)))] = true
+	}
+	for k := range rl.exempt.entries {
+		if !want[k] {
+			rl.exempt.deleteLocked([]byte(k))
+		}
+	}
+	for k := range want {
+		rl.exempt.updateLocked([]byte(k), U64(1), UpdateAny)
+	}
 }
 
 // SetRate changes the per-peer rate and burst; buckets keep their tokens.
