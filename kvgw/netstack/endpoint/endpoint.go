@@ -88,10 +88,10 @@ type Endpoint struct {
 	hmu        sync.RWMutex
 	dgHandlers [256]DatagramHandler
 	rawHandler [256]RawHandler
-	wake     chan struct{}
-	done     chan struct{}
-	wg       sync.WaitGroup
-	buf      []byte
+	wake       chan struct{}
+	done       chan struct{}
+	wg         sync.WaitGroup
+	buf        []byte
 
 	stats EndpointStats
 }

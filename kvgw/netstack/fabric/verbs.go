@@ -98,12 +98,12 @@ func newRequest(op byte, rr Remote, off uint64, extra int) request {
 // response is a view of a verb response.
 type response []byte
 
-func (r response) status() byte   { return r[2] }
-func (r response) flags() byte    { return r[3] }
-func (r response) hops() uint32   { return le.Uint32(r[4:]) }
-func (r response) id() uint64     { return le.Uint64(r[8:]) }
-func (r response) value() uint64  { return le.Uint64(r[16:]) }
-func (r response) data() []byte   { return r[respHeader:] }
+func (r response) status() byte  { return r[2] }
+func (r response) flags() byte   { return r[3] }
+func (r response) hops() uint32  { return le.Uint32(r[4:]) }
+func (r response) id() uint64    { return le.Uint64(r[8:]) }
+func (r response) value() uint64 { return le.Uint64(r[16:]) }
+func (r response) data() []byte  { return r[respHeader:] }
 func (r response) err() error {
 	if int(r.status()) < len(statusErr) {
 		return statusErr[r.status()]
