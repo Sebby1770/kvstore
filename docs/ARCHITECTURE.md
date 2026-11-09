@@ -387,3 +387,309 @@ full-size suites and CI runs them on every push.
   and that quorum operations waited for every replica, so an unreachable
   one stalled each phase by its full timeout; they now return once the quorum
   is in and give stragglers a short grace period.
+
+---
+
+# 2.2 — the autonomous fabric
+
+2.2 adds nine capabilities in three groups: kernel bypass and zero-copy
+execution, self-healing topology, and network-aware runtime. Each one is a
+package with its own tests, built to the same rules as the rest: sans-IO
+cores, seeded and reproducible tests, hostile input fuzzed, standard library
+only. `runtime/node` wires all of them into `kvmesh`.
+
+```
+                   HTTP adds: /replica · /spec/kv · /fabric · /mesh/{time,foresight,offload,pressure,spec,fabric}
+   ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+   │ runtime/  foresight  LSTM + φ-accrual + fuzzy inference over link telemetry → failure     │
+   │                      forecasts → pre-emptive leader handover, actor placement             │
+   │           speculate  hedged execution, gossiped load digests, epidemic cancellation        │
+   │           crdt       delta CRDTs (PN-counter, LWW, MV-register, add-wins OR-set)           │
+   │           causal     causal broadcast over lossy datagrams, matrix-clock garbage collection │
+   │           vtime      PTP-style clock discipline, TrueTime intervals, BMCA, sequencer        │
+   ├──────────────────────────────────────────────────────────────────────────────────────────┤
+   │ netstack/ offload    verified eBPF programs at an XDP/TC-style endpoint hook: rate limiter, │
+   │                      circuit breaker, heartbeat responder, Maglev load balancer            │
+   │           fabric     registered memory + one-sided verbs (READ/WRITE/CAS/FADD/CHASE)        │
+   │           pmd        DPDK-style rings, mbuf pools, poll-mode lcores, RSS, memif              │
+   │           multipath  MPTCP-style sessions over many KTP subflows                           │
+   │           segroute   SRv6-style source routing through relays                              │
+   │           rpc        + worker pool advertising APP_PRESSURE credits, Reactive Streams demand │
+   │           ktp/wire   + APP_PRESSURE frame (0x31)                                           │
+   └──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## What is real and what stands in for hardware
+
+Some of these ideas assume hardware (RDMA NICs, CXL memory, SmartNICs and
+DPUs, NICs bound to DPDK, PTP time cards) or kernel access (eBPF, XDP) that a
+portable, standard-library Go program cannot have. In each case the
+structures, algorithms, wire formats and failure semantics are the real
+ones. The hardware's job is done by the closest software equivalent, and
+the docs say which.
+
+| Idea | What runs here | Stand-in for |
+|---|---|---|
+| RDMA one-sided verbs | fixed-layout verbs executed in the endpoint's packet path against registered memory; no application goroutine runs | the NIC executing verbs without the host CPU |
+| CXL shared memory | `fabric.MapFile`: a MAP_SHARED mapping that co-located processes share with plain loads, stores and atomics | **real**, on one host |
+| SmartNIC / eBPF | real eBPF bytecode (kernel encoding and helper numbers), verified and interpreted at the endpoint's ingress/egress hook | running on the card, or JIT-ed at XDP |
+| DPDK | rte_ring, mbuf pools, poll-mode lcores and Toeplitz RSS in Go; the memif port is a **real** zero-copy, syscall-free path between processes | a physical NIC's queues polled from userspace |
+| PTP time appliance | two-way time transfer with software timestamps; rigorous error intervals | hardware timestamps (smaller ε, same maths) |
+| MPTCP / SRv6 | multipath sessions over KTP subflows; source routing through KTP-aware relays | kernel MPTCP; IPv6 segment routing headers |
+
+## Group 1 — kernel bypass and zero-copy execution
+
+### netstack/fabric — single-address-space memory
+
+A `Region` is registered memory: a heap arena or a shared file mapping. A
+`Ptr` is a global pointer (16-bit region, 48-bit offset). Peers use five
+one-sided verbs, each a fixed-layout record that the owner reads in place:
+
+```
+request  tag | op | region | rkey | request id | offset | length/hops | chase read len
+         | chase link off | chase key off | arg0 (expected / delta / key) | arg1 (new / flags) | data
+response tag | op | status | flags | hops | request id | value (previous / end offset) | data
+```
+
+* READ, WRITE, CAS, FETCH_ADD, and CHASE. CHASE walks a linked structure on
+  the owner (follow the word at `link_off`, stop on a matching key or after
+  `max_hops`) and returns the node it ends on, so a remote pointer chase
+  costs one round trip instead of one per hop.
+* Execution: `endpoint.HandleDatagrams(tag, h)` runs `h` in the packet path,
+  under the endpoint lock, as soon as the datagram is decrypted. The reply
+  goes back on the same connection. No goroutine is scheduled and no handler
+  is called.
+* Safety: random 32-bit rkeys, per-region permissions (read, write,
+  atomic), and every access is bounds- and alignment-checked.
+* Reliability: verbs travel as unreliable datagrams and are retried with
+  exponential backoff. Responses to WRITE, CAS and FETCH_ADD are cached per
+  (connection, request id), so a retry is answered from the cache rather
+  than executed twice. The test runs 200 FETCH_ADDs at 15% loss and 10%
+  duplication and gets an exact count.
+* `fabric.Index` is a lock-free hash index that lives entirely in one region,
+  in the style of FaRM and Pilaf. Insert is FETCH_ADD (allocate), WRITE
+  (entry pointing at the current bucket head), then CAS (publish), retried
+  on conflict. Lookup is a READ of the bucket head plus a CHASE. After
+  formatting the region, the owner runs no code for the index at all.
+
+### netstack/offload — network functions in the data path
+
+* **ISA.** eBPF's instruction encoding, registers r0-r10 (r10 read-only, a
+  512-byte stack), the ALU/ALU64, JMP/JMP32, LDX/ST/STX and ATOMIC add
+  classes, LD_IMM64 with pseudo-map-fd map references, and helpers by kernel
+  number: lookup 1, update 2, delete 3, ktime 5, prandom 7, redirect_map 51.
+  `HelperMAC64` (0x10001) is the one non-kernel helper, a keyed MAC
+  primitive of the kind a SmartNIC provides. `Encode` produces the bytes the
+  `bpf()` syscall takes; a test checks `mov r0,2; exit` against its known
+  encoding.
+* **Verifier.** It proves termination structurally: every jump goes
+  forward, so an n-instruction program runs at most n instructions. It also
+  validates every opcode, register, jump target, map reference, helper and
+  argument count, and tracks which registers are initialised along every
+  path (an intersection over predecessors).
+* **Memory safety at run time.** Every pointer value carries a tag for the
+  region it points into (context, packet, stack, a map value obtained in
+  this run, or a map reference), and every load and store is bounds-checked
+  against that region. Forging a tag can only reach memory the program
+  already owns. A fault aborts the run (XDP_ABORTED).
+* **Hook.** `endpoint.SetFilter` runs ingress programs on every datagram
+  before connection lookup, and egress programs before every socket write.
+  Verdicts work as in XDP: PASS, DROP, TX (rewrite and send back), and
+  REDIRECT. Redirects to an address are sent encapsulated
+  (`0xE2 'L' 'B' | origin | packet`); `TrustEncapsulation` lists the
+  balancers allowed to send them. Redirects to a `QueueMap` hand the packet
+  to Go code, like an AF_XDP socket.
+* **Maps.** Array, hash (optionally LRU), `AddrMap` (DEVMAP-like redirect
+  targets) and `QueueMap` (XSKMAP-like). A program run holds the locks of
+  all its maps, taken in creation order, and Go-side access takes the same
+  locks.
+* **Programs.**
+  * Rate limiter: per-peer token buckets in an LRU map, metering Initial
+    and Raw packets (connection attempts and gossip). The node sets each
+    member's share of the cluster budget whenever membership changes.
+  * Circuit breaker: counts failures per peer, from stateless resets in the
+    data path and from host-reported errors. When it trips, the egress
+    program drops traffic to that peer; after a cooldown it lets one probe
+    through (half-open), and any healthy packet closes the circuit again.
+  * Heartbeat responder: answers MAC-authenticated 48-byte probes with
+    XDP_TX and adds how long ago the host process last checked in. A node
+    that answers but reports a stale host is hung, not dead.
+  * Maglev: the paper's lookup-table construction (1021 slots,
+    per-backend permutations), with flows steered by peer hash. Backends
+    answer clients directly (direct server return); the test carries a real
+    KTP handshake through it.
+
+### netstack/pmd — userspace data plane
+
+* `Ring` is DPDK's rte_ring: producer and consumer head/tail pairs, each on
+  its own cache line, CAS reservation and in-order commit, multi-producer
+  and multi-consumer, with burst enqueue and dequeue. It lives in a fabric
+  region, so it works across processes.
+* `Pool` is an mbuf pool: fixed buffers with 16-byte headers plus a ring of
+  free indices, with no per-packet allocation. `Mbuf` is a two-word value.
+* `Memif` is a shared-memory interface between two processes: one file
+  holds a ring per direction and the shared pool. Sending a packet means
+  enqueuing a buffer index, and the receiver reads it where the sender
+  wrote it. The tests check zero copies (same buffer index on both sides),
+  exchange packets with a child process through shared memory alone, and
+  run the whole KTP stack over memif (a 2 MiB stream). In the in-process
+  benchmark a packet costs about 7 ns.
+* `Lcore` is a run-to-completion poll loop pinned with LockOSThread. Its
+  `Idler` busy-polls while traffic flows, then yields, then sleeps in steps
+  up to 1 ms.
+* `Toeplitz` and `Steer` implement RSS. The hash is checked against
+  Microsoft's published verification vectors.
+* `SocketPort` drives the same Port API from a kernel socket. `PacketConn`
+  adapts any Port to `net.PacketConn`.
+
+## Group 2 — self-healing topology
+
+### runtime/foresight — fuzzy failure prediction
+
+* Each interval, per peer, it collects RTT inflation (srtt/min_rtt − 1),
+  jitter (rttvar/srtt), loss (with a 40-packet prior so idle links cannot
+  fake it), PTOs, congestion-window collapse (1 − cwnd/peak), heartbeat RTT
+  and misses, and the peer's reported staleness.
+* Features are normalised against the link's own slowly adapting baseline.
+  The baseline stops adapting while the peer looks unwell, so failure is
+  never learnt as normal.
+* An online LSTM per link (12 units, truncated BPTT over 16 steps, Adam,
+  global gradient clipping) is gradient-checked against central differences
+  for every parameter. Its five-step autoregressive forecast is ensembled
+  with a smoothed persistence-plus-trend extrapolation, taking the more
+  pessimistic of the two. The LSTM covers learnt dynamics; the trend covers
+  ramps it has never seen. Its one-step error is reported as "surprise".
+* φ-accrual (Hayashibara) runs over heartbeat arrivals, with an asymptotic
+  erfc tail so φ keeps rising during long silences.
+* Mamdani fuzzy inference: trapezoid and shoulder membership functions,
+  min/max rules, centroid defuzzification. The result is a likelihood in
+  [0, 1] with reasons, a healthy/degrading/failing state with hysteresis,
+  and a hung flag.
+* Test results:
+  * A grey failure (latency ×10, loss to 20%, cwnd collapse) is called
+    failing 12–22 intervals before the node drops. φ alone fires 1–3
+    intervals after it drops.
+  * No failing calls across 20 seeds of jittery healthy links.
+  * After recovery the peer returns to healthy.
+* What the node does with it:
+  * Actor placement avoids peers forecast to fail, before SWIM suspects
+    them.
+  * A leader that forecasts most of its voter links failing transfers
+    leadership to the voter it reaches best, retrying every ten probe
+    intervals. `TestForesightHandsLeadershipOver` degrades a leader's
+    network and checks it steps down by itself.
+
+### runtime/speculate — epidemic speculative execution
+
+* Push gossip spreads load digests (load, queue, p50, p99). In the test,
+  16 nodes converge in 10 rounds.
+* The executor ranks candidates by expected latency, using observations,
+  then digests, then live RPC pressure. It hedges to the next candidate once
+  the primary passes its usual p95, up to `MaxCopies`, under a token-bucket
+  budget. A failed copy is replaced at once (failover, outside the budget).
+* The first success wins. The losers' streams are reset, and a cancel
+  datagram goes to every node that got a copy. `Registry` stops a running
+  copy, and refuses one that arrives late (tombstones last 30 s).
+  Cancellation also chains through nested calls by context.
+* With 10% random 200 ms stalls, p99 drops from 202 ms to 23 ms. `kvmesh`
+  uses this for `GET /spec/kv/{key}` across coordinators.
+
+### runtime/causal and runtime/crdt — coordination-free replication
+
+* `causal`: messages carry their origin's vector of delivered sequence
+  numbers. They are sent once, eagerly, and buffered until their causal
+  predecessors arrive. Repair is by digest anti-entropy (push what the
+  digest lacks; answer with our own digest if the sender knows more).
+  Retransmission logs are dropped at causal stability, computed from a
+  matrix clock. `FastForward` lets a snapshot-bootstrapped node skip
+  history that has already been garbage collected.
+* `crdt`: delta-state CRDTs with dotted causal contexts — a PN-counter, an
+  LWW register (on HLC time), a multi-value register and an add-wins
+  observed-remove set — in a named-object store. Each delta is a valid
+  state and merging is a semilattice join.
+* Tests:
+  * Lattice laws hold for every type.
+  * Add-wins and concurrent-write semantics behave as specified.
+  * Causal delivery is exactly-once and in order across 20 seeds at 20%
+    loss with duplication and reordering, and partitions heal.
+  * Five stores updating concurrently over a lossy network converge
+    byte-identically.
+* The 1.x KV-backed CRDTs keep `/crdt/...`. The new in-memory replicated
+  objects live at `/replica/...`.
+
+## Group 3 — network-aware runtime
+
+### netstack/multipath and netstack/segroute
+
+* A `Session` is one byte stream over several subflows. Each subflow is its
+  own KTP connection on its own path, with its own congestion control.
+  Segments carry data sequence numbers; schedulers are ECF (default),
+  MinRTT, round-robin and redundant.
+* Data ACKs are cumulative KTP datagrams that acknowledge what the
+  application has read, so the send buffer is also the flow-control window.
+* A subflow is suspected only when it holds old unacknowledged data *and*
+  its connection has heard nothing for as long. Its segments are then
+  reinjected elsewhere. (Old data alone proves nothing: cumulative ACKs make
+  fast paths wait on slow ones.)
+* Joins need the session token and the same KTP peer identity.
+* `segroute.Conn` prepends `0xE5 'S' 'R' | left | n | segments` for routed
+  destinations. Each `Relay` pops itself off the list and forwards, and
+  learns the way back per KTP connection ID, so replies need no header.
+* Over fiber, cellular and satellite-like links, 16 MiB takes 6.8–7.7 s
+  versus 11.4 s on the best single path (the run-to-run spread comes from
+  goroutine interleavings, even on virtual time). A path blackholed mid-transfer is
+  reinjected around, and a relay-routed subflow can join a session next to
+  a direct one.
+
+### runtime/vtime — deterministic virtual time
+
+* Two-way time transfer (IEEE 1588 delay request-response) with a lucky
+  packet filter and a PI servo: step above 5 ms, otherwise slew phase and
+  frequency.
+* `Interval()` provably contains grandmaster time: δ (mean one-way delay,
+  which bounds any path asymmetry), plus the servo residual, plus
+  (maxDrift + |rate|) times the time since the sample. 40 randomised
+  scenarios check containment on every reading.
+* The grandmaster is elected by IEEE 1588 dataset comparison (BMCA) over
+  the live members. Every node's HLC reads its disciplined clock.
+* `Matrix` is a matrix clock for causal stability. `Sequencer` releases
+  HLC-stamped events up to the lowest member watermark, in (timestamp,
+  origin) order, which gives the same total order on every node with no
+  coordinator and no wall-clock wait. `CommitWait` adds external
+  consistency for a local ε wait.
+
+### APP_PRESSURE — application-aware backpressure (ktp, rpc)
+
+* Frame `0x31`: `flags | [stream id] | seq | credits | load ‰ | queue`.
+  Updates coalesce per scope (connection, or one stream). A lost frame is
+  repaired only if it is still the latest, and receivers keep the highest
+  sequence number seen.
+* Pressure is opt-in per connection, and only sent to peers that have spoken
+  it, so kvnode never receives one. Kvnode parses and ignores it anyway, and
+  the Go↔Rust vectors pin the encoding.
+* `rpc.Server.SetLimits` creates a bounded worker pool that advertises
+  cumulative call credits: calls received plus free capacity. Unlike an
+  absolute "N free", a cumulative limit is never wrong by the calls still in
+  flight. The client blocks the *caller* at the limit, with a probe timer as
+  a safety valve.
+* `CallStream(..., Demand(n))` is Reactive Streams `request(n)`: the
+  server's send blocks while the consumer has granted nothing.
+* In the test, 40 callers hit a 4-slot, 2-queue server with zero rejections
+  and never more than 4 handlers running.
+
+## Node integration (runtime/node/autonomy.go)
+
+| | where | default |
+|---|---|---|
+| heartbeat responder + prober | endpoint hook; probes every member each probe interval | on |
+| rate limiter | endpoint hook; per-node share of `--rate-limit` | off |
+| circuit breaker | endpoint hook | off (`--circuit-breaker`) |
+| fabric index | 4 MiB region, handle gossiped in SWIM meta (`fabric`) | on (`--fabric-region`) |
+| clock discipline | raw tag 0xA1, grandmaster = BMCA winner | on |
+| replicated objects | raw tag 0xC5, bootstrap from a peer's snapshot | on |
+| failure forecasts | probe interval; placement + leader handover | on |
+| speculation | raw tag 0xD3 (digests, cancels); `/spec/kv` | on |
+| RPC backpressure | 512 slots / 4096 queue | on (`--rpc-concurrency`) |
+
+Raw-datagram tags below 0x20 belong to SWIM; the endpoint routes the rest
+to handlers by their first byte.

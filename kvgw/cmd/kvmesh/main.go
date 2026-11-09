@@ -51,6 +51,10 @@ func main() {
 	cc := flag.String("cc", "cubic", "KTP congestion controller: cubic, bbr or newreno")
 	maxVoters := flag.Int("max-voters", 5, "promote joining nodes to voters up to this many")
 	quiet := flag.Bool("quiet", false, "less logging")
+	rateLimit := flag.Uint64("rate-limit", 0, "per-peer packets/s for new connections and gossip, enforced in the data path (0 = off)")
+	breaker := flag.Bool("circuit-breaker", false, "shed traffic to peers that keep failing, in the data path")
+	rpcSlots := flag.Int("rpc-concurrency", 512, "RPC handler slots advertised to callers as backpressure (<0 = unlimited)")
+	fabricMem := flag.Int("fabric-region", 4<<20, "bytes of memory for the one-sided fabric index (<0 = off)")
 	flag.Parse()
 
 	if *name == "" {
@@ -68,6 +72,7 @@ func main() {
 		ClusterKey: []byte(*key), Insecure: *insecure, Congestion: *cc, Bootstrap: splitList(*bootstrap), Join: splitList(*join),
 		MaxVoters: *maxVoters, KVNodes: splitList(*kvnodes), RF: *rf, R: *rq, W: *wq,
 		Heartbeat: *hb, AntiEntropy: *ae, Logf: logf,
+		RateLimit: *rateLimit, CircuitBreaker: *breaker, RPCConcurrency: *rpcSlots, FabricRegion: *fabricMem,
 	})
 	if err != nil {
 		log.Fatalf("kvmesh: %v", err)

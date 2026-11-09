@@ -42,6 +42,7 @@ import (
 	"github.com/Sebby1770/kvstore/kvgw/runtime/control"
 	"github.com/Sebby1770/kvstore/kvgw/runtime/hlc"
 	"github.com/Sebby1770/kvstore/kvgw/runtime/swim"
+	"github.com/Sebby1770/kvstore/kvgw/runtime/vtime"
 )
 
 // Config configures a node.
@@ -79,6 +80,13 @@ type Config struct {
 
 	Logf func(format string, args ...any)
 
+	// Autonomy (see autonomy.go).
+	RateLimit      uint64 // per-peer budget for new connections + gossip, packets/s, enforced in the data path (0 = off)
+	CircuitBreaker bool   // shed traffic to peers that keep failing, in the data path
+	RPCConcurrency int    // RPC handler slots, advertised to callers as backpressure [512; <0 = unlimited]
+	RPCQueue       int    // RPC calls that may wait for a slot [4096]
+	FabricRegion   int    // bytes of one-sided fabric index memory [4 MiB; <0 = off]
+
 	// Test hooks: a PacketConn instead of a UDP socket, its resolver, and a
 	// factory for storage-node clients.
 	PacketConn net.PacketConn
@@ -90,7 +98,9 @@ type Config struct {
 type Node struct {
 	cfg      Config
 	identity ed25519.PrivateKey
-	clock    *hlc.Clock
+	vclock   *vtime.Clock // disciplined to the cluster grandmaster
+	clock    *hlc.Clock   // reads vclock
+	auto     *autonomy
 	events   *eventLog
 
 	ep      *endpoint.Endpoint
@@ -197,7 +207,8 @@ func Start(cfg Config) (*Node, error) {
 	}
 	n := &Node{cfg: cfg, kvNodes: map[string]kv.Node{}, peers: bootAddrs}
 	n.ctx, n.cancel = context.WithCancel(context.Background())
-	n.clock = hlc.New(time.Now, 500*time.Millisecond)
+	n.vclock = vtime.NewClock(nil, 0)
+	n.clock = hlc.New(n.vclock.Time, 500*time.Millisecond)
 	n.events = newEventLog(n.clock, 256)
 
 	// Identity.
@@ -250,6 +261,11 @@ func Start(cfg Config) (*Node, error) {
 		Metadata: func(context.Context) map[string]string { return map[string]string{"hlc": n.clock.Now().String()} },
 	})
 
+	if err := n.setupAutonomy(); err != nil {
+		n.ep.Close()
+		return nil, err
+	}
+
 	// Control plane.
 	n.raftTx = newRaftTransport(n)
 	var peers []string
@@ -292,9 +308,10 @@ func Start(cfg Config) (*Node, error) {
 	n.wg.Add(1)
 	go func() { defer n.wg.Done(); n.rpcSrv.Serve(n.ctx, n.ep) }()
 	n.swim.start()
-	n.wg.Add(2)
+	n.wg.Add(3)
 	go n.housekeeping()
 	go n.kvLoops()
+	go n.auto.loop()
 
 	if cfg.HTTP != "" {
 		ln, err := net.Listen("tcp", cfg.HTTP)
@@ -348,6 +365,7 @@ func (n *Node) Close() error {
 	n.swim.stop()
 	n.ctl.Stop()
 	n.raftTx.close()
+	n.auto.close()
 	err := n.ep.Close()
 	n.wg.Wait()
 	return err
@@ -365,6 +383,7 @@ func (n *Node) Crash() {
 	n.actors.Close(ctx)
 	n.swim.stop()
 	n.raftTx.close()
+	n.auto.close()
 	n.ep.Close()
 	n.wg.Wait()
 }

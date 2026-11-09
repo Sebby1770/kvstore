@@ -196,8 +196,13 @@ func (d *Detector) Observe(name string, s Sample, now time.Time) Assessment {
 		raw[fInflation] = math.Max(float64(s.SRTT)/float64(s.MinRTT)-1, 0)
 		raw[fJitter] = float64(s.RTTVar) / float64(s.SRTT)
 	}
-	if sent := s.PacketsSent - p.prev.PacketsSent; sent > 0 && s.PacketsLost >= p.prev.PacketsLost {
-		raw[fLoss] = math.Min(float64(s.PacketsLost-p.prev.PacketsLost)/float64(sent), 1)
+	if sent := s.PacketsSent - p.prev.PacketsSent; s.PacketsLost >= p.prev.PacketsLost {
+		// A quiet link sends a handful of packets per interval, and one
+		// spuriously declared loss (reordering) would read as heavy loss.
+		// Shrink the estimate towards zero with a prior worth lossPrior
+		// packets: negligible on a busy link, decisive on an idle one.
+		const lossPrior = 40
+		raw[fLoss] = math.Min(float64(s.PacketsLost-p.prev.PacketsLost)/float64(sent+lossPrior), 1)
 	}
 	if s.PTOs >= p.prev.PTOs {
 		raw[fPTO] = math.Min(float64(s.PTOs-p.prev.PTOs), 10)

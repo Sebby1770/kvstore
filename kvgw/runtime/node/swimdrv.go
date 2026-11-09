@@ -16,10 +16,12 @@ import (
 // algorithm the KV ring uses, so an actor moves only when its owner leaves
 // or a new member out-scores it.
 type memberView struct {
-	self string
-	mu   sync.RWMutex
-	all  map[string]swim.Member
-	ring *ring.Ring
+	self  string
+	mu    sync.RWMutex
+	all   map[string]swim.Member
+	ring  *ring.Ring
+	last  []swim.Member
+	avoid map[string]bool // members foresight forecasts to fail
 }
 
 func newMemberView(self string) *memberView {
@@ -29,8 +31,9 @@ func newMemberView(self string) *memberView {
 func (v *memberView) set(ms []swim.Member) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.last = ms
 	v.all = map[string]swim.Member{}
-	var live []string
+	var live, steady []string
 	for _, m := range ms {
 		v.all[m.Name] = m
 		// Suspects are excluded from placement. SWIM keeps a suspect in the
@@ -40,10 +43,38 @@ func (v *memberView) set(ms []swim.Member) {
 		// activation harmless and the actor moves back.
 		if m.State == swim.StateAlive {
 			live = append(live, m.Name)
+			// Members foresight forecasts to fail are avoided too -- earlier
+			// still, before SWIM suspects them at all.
+			if !v.avoid[m.Name] || m.Name == v.self {
+				steady = append(steady, m.Name)
+			}
 		}
+	}
+	if len(steady) > 0 {
+		live = steady
 	}
 	sort.Strings(live)
 	v.ring = ring.New(live)
+}
+
+// setAvoid updates the members to keep actors away from; it reports
+// whether placement changed.
+func (v *memberView) setAvoid(avoid map[string]bool) bool {
+	v.mu.Lock()
+	same := len(avoid) == len(v.avoid)
+	for k := range avoid {
+		if !v.avoid[k] {
+			same = false
+		}
+	}
+	v.avoid = avoid
+	last := v.last
+	v.mu.Unlock()
+	if same {
+		return false
+	}
+	v.set(last)
+	return true
 }
 
 func (v *memberView) get(name string) (swim.Member, bool) {
@@ -97,7 +128,11 @@ func newSwimDriver(n *Node) *swimDriver {
 }
 
 func (n *Node) swimMeta() map[string]string {
-	return map[string]string{"http": n.cfg.HTTPAdvertise, "identity": Fingerprint(n.identity.Public().(ed25519PublicKey))}
+	m := map[string]string{"http": n.cfg.HTTPAdvertise, "identity": Fingerprint(n.identity.Public().(ed25519PublicKey))}
+	if f := n.auto.fabricMeta(); f != "" {
+		m["fabric"] = f
+	}
+	return m
 }
 
 func (d *swimDriver) start() {
