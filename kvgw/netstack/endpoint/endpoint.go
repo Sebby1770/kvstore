@@ -83,6 +83,11 @@ type Endpoint struct {
 
 	acceptCh chan *Conn
 	rawCh    chan RawPacket
+
+	// tagged handlers (see handlers.go); read without e.mu
+	hmu        sync.RWMutex
+	dgHandlers [256]DatagramHandler
+	rawHandler [256]RawHandler
 	wake     chan struct{}
 	done     chan struct{}
 	wg       sync.WaitGroup
@@ -251,6 +256,15 @@ func (e *Endpoint) handleDatagram(pkt []byte, from net.Addr) {
 		if err != nil {
 			return
 		}
+		if len(payload) > 0 {
+			if rh := e.rawHandlerFor(payload[0]); rh != nil {
+				e.mu.Lock()
+				e.stats.RawIn++
+				e.mu.Unlock()
+				rh(from.String(), payload)
+				return
+			}
+		}
 		select {
 		case e.rawCh <- RawPacket{From: from.String(), Payload: payload}:
 			e.mu.Lock()
@@ -319,6 +333,12 @@ func (e *Endpoint) resetLocked(h wire.Header, to net.Addr, now time.Time) {
 // flushLocked sends everything c has queued, processes its events, wakes its
 // waiters, and forgets it once it is fully closed.
 func (e *Endpoint) flushLocked(c *Conn) {
+	for e.flushOnceLocked(c) {
+		// A datagram handler queued replies: send them too.
+	}
+}
+
+func (e *Endpoint) flushOnceLocked(c *Conn) (again bool) {
 	now := time.Now()
 	for {
 		n := c.kc.Poll(e.buf, now)
@@ -357,6 +377,8 @@ func (e *Endpoint) flushLocked(c *Conn) {
 			}
 		case ktp.EventStreamOpened:
 			c.acceptQ = append(c.acceptQ, ev.Stream)
+		case ktp.EventDatagram:
+			again = e.dispatchDatagramsLocked(c) || again
 		case ktp.EventClosed:
 			c.markDone(c.kc.Err())
 		}
@@ -369,6 +391,7 @@ func (e *Endpoint) flushLocked(c *Conn) {
 	}
 	c.broadcast()
 	e.kick()
+	return again
 }
 
 func (e *Endpoint) forgetLocked(c *Conn) {
