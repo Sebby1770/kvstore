@@ -277,3 +277,23 @@ func (r *Region) Chase(start uint64, s ChaseSpec) (ChaseResult, error) {
 }
 
 var le = binary.LittleEndian
+
+// Word returns a pointer to the 8-byte-aligned word at off, for structures
+// (rings, locks) that live in a region and manipulate it with sync/atomic
+// directly. The pointer is valid while the region is mapped.
+func (r *Region) Word(off uint64) (*uint64, error) { return r.word(off) }
+
+// Words returns n consecutive words starting at off as a slice aliasing the
+// region (8-byte aligned).
+func (r *Region) Words(off uint64, n int) ([]uint64, error) {
+	if off%8 != 0 {
+		return nil, ErrAlign
+	}
+	if err := r.check(off, uint64(n)*8); err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	return unsafe.Slice((*uint64)(unsafe.Pointer(&r.mem[off])), n), nil
+}
