@@ -93,6 +93,7 @@ const (
 	fkMaxData
 	fkMaxStreamData
 	fkMaxStreams
+	fkPressure
 )
 
 type sentPacket struct {

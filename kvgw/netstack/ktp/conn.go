@@ -38,6 +38,7 @@ const (
 	EventStopSending                     // the peer asked us to stop sending
 	EventDatagram                        // a datagram arrived (see RecvDatagram)
 	EventClosed                          // the connection is closing or closed (see Err)
+	EventPressure                        // the peer reported application pressure (see PeerPressure; Stream set for stream scope)
 )
 
 // Event is one notification for the driver.
@@ -119,6 +120,8 @@ type Stats struct {
 	CongestionEvents uint64        `json:"congestion_events"`
 	StreamsOpen      int           `json:"streams_open"`
 	Handshake        time.Duration `json:"handshake"`
+	PressureIn       uint64        `json:"pressure_in"`  // APP_PRESSURE frames received
+	PressureOut      uint64        `json:"pressure_out"` // APP_PRESSURE frames sent (incl. resends)
 }
 
 // Conn is one KTP connection as a pure state machine: feed it datagrams with
@@ -184,6 +187,9 @@ type Conn struct {
 
 	dgOut, dgIn [][]byte
 	events      []Event
+
+	// application backpressure (APP_PRESSURE, see pressure.go)
+	press pressureState
 
 	// close
 	closeFrame *wire.ConnectionClose
@@ -386,6 +392,7 @@ func (c *Conn) Stats() Stats {
 		PacketsSent: c.pktsSent, PacketsReceived: c.pktsRecv, PacketsLost: c.rec.lost, PacketsDropped: c.pktsDropped,
 		BytesSent: c.bytesSent, BytesReceived: c.bytesRecv, StreamBytesRetx: c.retxBytes,
 		PTOCount: c.rec.ptos, CongestionEvents: c.rec.congestionEvents, StreamsOpen: len(c.streams),
+		PressureIn: c.press.in, PressureOut: c.press.out,
 	}
 	if s.SSThresh > 1<<40 {
 		s.SSThresh = 0 // "infinite" before the first loss
@@ -576,6 +583,7 @@ func (c *Conn) maybeRetire(s *stream) {
 		return
 	}
 	delete(c.streams, s.id)
+	c.forgetPressure(s.id)
 	i := sort.Search(len(c.order), func(i int) bool { return c.order[i] >= s.id })
 	if i < len(c.order) && c.order[i] == s.id {
 		c.order = append(c.order[:i], c.order[i+1:]...)

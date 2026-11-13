@@ -368,6 +368,8 @@ func (c *Conn) handleAppFrame(f wire.Frame, now time.Time) error {
 		}
 		c.dgIn = append(c.dgIn, append([]byte(nil), f.Data...))
 		c.emit(EventDatagram, 0, nil)
+	case wire.AppPressure:
+		return c.handlePressure(f)
 	default:
 		return errViolation
 	}
@@ -460,6 +462,8 @@ func (c *Conn) requeue(frames []sentFrame) {
 			c.needMaxStreams = true
 		case fkCtrl:
 			c.requeueCtrl(sf.ctrl)
+		case fkPressure:
+			c.requeuePressure(sf.ctrl)
 		}
 	}
 }

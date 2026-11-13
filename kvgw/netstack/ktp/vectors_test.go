@@ -121,6 +121,8 @@ func buildVectors(t *testing.T) string {
 		{"connection_close", wire.ConnectionClose{Code: 0x0a, Reason: "protocol violation"}},
 		{"handshake_done", wire.HandshakeDone{}},
 		{"datagram", wire.Datagram{Data: []byte("dgram")}},
+		{"app_pressure", wire.AppPressure{Seq: 7, Credits: 300, Load: 875, Queue: 12}},
+		{"app_pressure_stream", wire.AppPressure{Stream: true, StreamID: 9, Seq: 1 << 20, Credits: 64}},
 	}
 	var all []wire.Frame
 	for _, x := range frames {
@@ -144,6 +146,8 @@ func buildVectors(t *testing.T) string {
 		{wire.TypeHandshake, 9, 1, 2},                     // length past the end
 		{0x1f},                                            // unknown frame type
 		{wire.TypeStream | 0x02, 1, 0x40},                 // truncated varint
+		{wire.TypeAppPressure, 2, 1, 1, 1, 1},             // unknown APP_PRESSURE flags
+		{wire.TypeAppPressure, 0, 1, 1, 0x43, 0xe9, 0},    // load 1001 permille
 	} {
 		if _, err := wire.ParseFrames(bad); err == nil {
 			t.Fatalf("bad payload %d parsed: %x", i, bad)

@@ -66,6 +66,7 @@ func (n *Node) reqCtx(r *http.Request) (context.Context, context.CancelFunc) {
 
 func (n *Node) routes() {
 	mux := n.api.Mux()
+	n.autonomyRoutes(mux)
 	mux.HandleFunc("GET /mesh", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		io.WriteString(w, meshboardHTML)

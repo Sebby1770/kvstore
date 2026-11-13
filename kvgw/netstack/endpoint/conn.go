@@ -23,6 +23,7 @@ type Conn struct {
 	// guarded by ep.mu
 	notify    chan struct{}
 	acceptQ   []ktp.StreamID
+	dgq       [][]byte // untagged datagrams drained by dispatch, for ReceiveDatagram
 	readyOnce sync.Once
 	doneOnce  sync.Once
 	ready     chan struct{} // closed once established or failed
@@ -189,6 +190,12 @@ func (c *Conn) SendDatagram(p []byte) error {
 func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	for {
 		c.ep.mu.Lock()
+		if len(c.dgq) > 0 {
+			d := c.dgq[0]
+			c.dgq = c.dgq[1:]
+			c.ep.mu.Unlock()
+			return d, nil
+		}
 		if d, ok := c.kc.RecvDatagram(); ok {
 			c.ep.mu.Unlock()
 			return d, nil

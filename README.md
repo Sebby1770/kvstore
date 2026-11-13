@@ -7,7 +7,13 @@ each in the layer it fits; the Go tier is standard library only.
 KVStore 1.x was a quorum-replicated KV store behind a single gateway. 2.0 turns
 that gateway into a mesh: every node runs its own encrypted transport protocol,
 gossip membership, a Raft control plane, a virtual-actor runtime and a KV
-coordinator, and any node serves any request.
+coordinator, and any node serves any request. 2.2 makes the mesh run itself:
+it predicts node failure from link telemetry and acts before the failure, runs
+network functions as verified eBPF programs in the data path, offers one-sided
+memory verbs and a kernel-bypass shared-memory transport, replicates state
+without coordination, masks tail latency by speculation, splits streams across
+many paths, disciplines every clock to a grandmaster with provable error bounds,
+and carries application backpressure in the transport header.
 
 ```
                        HTTP: KV API · /mesh · /lease · /jobs · /actor · /registry
@@ -57,6 +63,43 @@ coordinator, and any node serves any request.
   independent implementation of the protocol in Rust (`kvnode/src/ktp`). Golden
   vectors generated from the Go code pin the two together byte for byte, and an
   interop suite drives the Rust server with the Go client over a lossy relay.
+
+**New in 2.2 — the autonomous fabric** (details and a real-versus-stand-in
+table in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#22--the-autonomous-fabric))
+
+- **Failure foresight** (`runtime/foresight`): per-link telemetry (RTT inflation,
+  jitter, loss, PTOs, congestion-window collapse, data-path heartbeats) feeds an
+  online LSTM, a φ-accrual detector and Mamdani fuzzy inference. A grey failure
+  is called 12–22 intervals before the node drops (φ alone: after it drops). A
+  leader that sees its own links failing hands leadership over; actors move off
+  peers forecast to fail.
+- **Network functions in the data path** (`netstack/offload`): real eBPF
+  bytecode, verified (forward-only, register tracking) and bounds-checked, at an
+  XDP/TC-style endpoint hook. Programs: distributed rate limiting, circuit
+  breaking, an authenticated heartbeat responder that reports host staleness
+  (hung versus dead), and a Maglev load balancer with direct server return.
+- **One-sided memory fabric** (`netstack/fabric`): registered regions, global
+  pointers, and READ/WRITE/CAS/FETCH_ADD/CHASE verbs executed in the owner's
+  packet path with no application code. Includes a lock-free remote hash index,
+  and shared-memory regions co-located processes use with plain atomics.
+- **Userspace data plane** (`netstack/pmd`): DPDK-style rings, mbuf pools,
+  poll-mode lcores and Toeplitz RSS, plus a memif shared-memory port that
+  carries KTP between processes with no syscalls and no copies (~7 ns a packet).
+- **Coordination-free state** (`runtime/causal`, `runtime/crdt`): causal
+  broadcast over lossy datagrams, and delta CRDTs that converge however the
+  network delivers them.
+- **Speculative execution** (`runtime/speculate`): hedged calls ranked by
+  gossiped load digests, with epidemic cancellation. p99 202 ms → 23 ms with
+  10% random stalls.
+- **Multipath and source routing** (`netstack/multipath`, `netstack/segroute`):
+  one stream over fiber + cellular + satellite subflows (16 MiB: 11.4 s → about
+  7 s), surviving a path dying mid-transfer; SRv6-style relay chains.
+- **Virtual time** (`runtime/vtime`): PTP-style discipline to an elected
+  grandmaster, readings as intervals that provably contain true time, matrix
+  clocks, and a sequencer giving one total order without waiting on clocks.
+- **Application backpressure** (`ktp` frame `0x31`, `rpc`): worker pools
+  advertise cumulative call credits in the transport header and callers block at
+  the limit. Streaming calls get Reactive Streams demand.
 
 The design contract is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md); every
 package's `doc.go` explains its protocol.
@@ -202,6 +245,31 @@ CUBIC (`--cc` changes it), and `ktpcat` defaults to BBR.
 Wire format, handshake and recovery are documented in
 [`kvgw/netstack/ktp/doc.go`](kvgw/netstack/ktp/doc.go).
 
+## The autonomous fabric (2.2)
+
+Every kvmesh node runs the 2.2 layers. Against any node's HTTP port:
+
+```sh
+# coordination-free replicated objects (counter, register, mvregister, set)
+curl -X POST localhost:8090/replica/counter/visits -d '{"action":"add","amount":5}'
+curl -X POST localhost:8090/replica/set/tags -d '{"action":"add","value":"blue"}'
+curl localhost:8090/replica/visits          # the same on every node, without coordination
+
+curl localhost:8090/spec/kv/hello           # read via whichever coordinator answers first
+curl -X PUT localhost:8090/fabric/k -d v    # into this node's one-sided index
+curl localhost:8091/fabric/n1/k             # another node reads it with RDMA-style verbs
+
+curl localhost:8090/mesh/foresight          # failure forecasts per peer, with reasons
+curl localhost:8090/mesh/time               # grandmaster, offset, error interval
+curl localhost:8090/mesh/offload            # data-path programs and their verdicts
+curl localhost:8090/mesh/pressure           # worker pool + peers' advertised credits
+curl localhost:8090/mesh/spec               # hedges, wins, cancels, gossiped digests
+```
+
+`kvmesh` flags: `--rate-limit N` (per-peer packets/s for connection attempts and
+gossip, enforced in the data path), `--circuit-breaker`, `--rpc-concurrency N`
+(default 512), `--fabric-region BYTES` (default 4 MiB, `-1` = off).
+
 ## Testing the hard parts
 
 Every protocol core is a **sans-IO state machine** — no sockets, clocks or
@@ -228,6 +296,21 @@ clusters deterministically from a seed and replay failures exactly:
 - **Fuzzing**: every network-facing decoder (KTP packets and frames behind
   authentication, Raft messages, SWIM gossip, RPC frames, control commands).
   Fuzzing found two real Raft crashes on malformed messages, now validated away.
+- **2.2**:
+  - The LSTM's backpropagation is checked against numerical gradients for
+    every parameter.
+  - Foresight predicts grey failures across seeds with no false failing
+    calls on 20 jittery healthy links.
+  - Clock intervals contain true time on every reading across 40 random
+    offset, drift and asymmetry scenarios.
+  - Causal delivery is exactly-once and in order at 20% loss.
+  - CRDTs pass the semilattice laws and five-replica convergence.
+  - Remote FETCH_ADD is exact under 15% loss.
+  - Random bytecode that passes the verifier always terminates, with no
+    panic over millions of fuzz executions.
+  - Memif exchanges packets with a child process.
+  - Maglev carries a real KTP handshake by direct server return.
+  - A degrading leader hands over by itself (`TestForesightHandsLeadershipOver`).
 
 ## Use it manually (single gateway, 1.x)
 
@@ -568,6 +651,18 @@ prefix (`memcmp`; empty prefix = full scan). Inserts that would return
 - **Membership changes are single-server** (one voter or learner at a time), and
   the control plane is sized for metadata, not bulk data.
 - Fixed-size slots and `MS_SYNC` per write are honest, not fast.
+- **2.2's hardware ideas run in software.** One-sided verbs execute in the
+  owner's endpoint (its CPU still runs; a NIC is what removes it). eBPF
+  programs run in an interpreter at a userspace hook, not at kernel XDP or on a
+  SmartNIC. The DPDK structures poll memif and sockets, not a NIC bound to
+  userspace. Clock discipline uses software timestamps (microseconds to a
+  millisecond of ε, not a PTP card's nanoseconds). Memif and `fabric.MapFile`
+  shared memory are the exception: genuine kernel bypass between processes on
+  one host. `docs/ARCHITECTURE.md` has the table.
+- **Replicated objects live in memory.** A restarted node rebuilds them from a
+  peer's snapshot. The whole cluster restarting loses them, and a node that
+  restarts alone must bootstrap before writing, or its new updates can collide
+  with its own old ones.
 
 ## JS client
 
@@ -591,12 +686,22 @@ kvgw/                 Go module (standard library only)
   netstack/ktp        KTP transport (sans-IO): handshake, streams, recovery, NewReno/CUBIC/BBR
   netstack/simnet     in-memory lossy packet network for tests (synctest-friendly)
   netstack/endpoint   KTP over a UDP socket: dial/accept, streams, raw datagrams, resets
-  netstack/rpc        unary + streaming RPC over KTP streams
+  netstack/rpc        unary + streaming RPC over KTP streams, worker pool + APP_PRESSURE credits
+  netstack/fabric     registered memory, one-sided verbs, remote hash index, shared mappings
+  netstack/offload    eBPF ISA, verifier, interpreter, maps, endpoint hook, built-in programs
+  netstack/pmd        DPDK-style rings, mbuf pools, lcores, RSS, memif shared-memory port
+  netstack/multipath  MPTCP-style sessions over KTP subflows
+  netstack/segroute   SRv6-style source routing and relays
   runtime/hlc         hybrid logical clocks
   runtime/swim        SWIM + Lifeguard membership (sans-IO)
   runtime/raft        Raft (sans-IO) + file storage
   runtime/control     replicated control-plane FSM + the Service that runs it on Raft
   runtime/actor       virtual actors
+  runtime/vtime       PTP-style clock discipline, TrueTime intervals, BMCA, matrix clocks, sequencer
+  runtime/causal      causal broadcast over lossy datagrams (sans-IO)
+  runtime/crdt        delta CRDTs: PN-counter, LWW, MV-register, add-wins OR-set
+  runtime/foresight   failure prediction: LSTM + φ-accrual + fuzzy inference
+  runtime/speculate   speculative execution, load gossip, epidemic cancellation
   runtime/node        the kvmesh daemon: every layer wired together, HTTP routes, control room
   internal/cluster    quorum coordinator: replication, repair, CAS, TTL, hints, epochs
   internal/httpapi    the KV HTTP API + dashboard (shared by gateway and kvmesh)
