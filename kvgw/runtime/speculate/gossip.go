@@ -134,16 +134,32 @@ func (g *Gossip) expireLocked() {
 	}
 }
 
-// merge keeps the newest digest per node.
+// maxTable bounds the digests held; maxName the strings in one.
+const (
+	maxTable = 4096
+	maxName  = 256
+)
+
+// merge keeps the newest digest per node. Digests come from peers, so:
+// a timestamp in the future is pulled back to now (otherwise it would never
+// expire), oversized names are dropped, and the table is bounded.
 func (g *Gossip) merge(ds []Digest) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	now := g.now()
 	for _, d := range ds {
-		if d.Addr == "" || d.Addr == g.self.Addr {
+		if d.Addr == "" || d.Addr == g.self.Addr || len(d.Addr) > maxName || len(d.Node) > maxName {
 			continue
 		}
-		if old, ok := g.table[d.Addr]; ok && old.Node == d.Node && old.Seq >= d.Seq {
+		old, known := g.table[d.Addr]
+		if known && old.Node == d.Node && old.Seq >= d.Seq {
 			continue
+		}
+		if !known && len(g.table) >= maxTable {
+			continue
+		}
+		if d.At > now {
+			d.At = now
 		}
 		g.table[d.Addr] = d
 	}

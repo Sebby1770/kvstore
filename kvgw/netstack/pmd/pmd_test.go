@@ -455,3 +455,18 @@ func BenchmarkMemifPackets(b *testing.B) {
 		c.Pool().Put(rx[:k]...)
 	}
 }
+
+// A peer process can write any length into an mbuf header in shared memory:
+// Data must never slice past the buffer.
+func TestMbufLengthFromPeerIsClamped(t *testing.T) {
+	r := fabric.NewRegion(int(PoolBytes(4, 256)) + 64)
+	p, err := FormatPool(r, 0, 4, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ := p.Get()
+	r.Store64(m.off(), 1<<31) // what a hostile peer might write
+	if n := len(m.Data()); n != len(m.Room()) {
+		t.Fatalf("Data() is %d bytes, room %d", n, len(m.Room()))
+	}
+}

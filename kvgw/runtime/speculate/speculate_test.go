@@ -247,3 +247,34 @@ func FuzzHandleRaw(f *testing.F) {
 		r.HandleRaw("x", b)
 	})
 }
+
+// Digests come from peers: a timestamp in the future must still expire, and
+// a flood of distinct addresses cannot grow the table without bound.
+func TestGossipRejectsHostileDigests(t *testing.T) {
+	now := int64(1_000_000_000_000)
+	g := NewGossip("me", "me", 1)
+	g.SetClock(func() int64 { return now })
+	g.merge([]Digest{{Node: "evil", Addr: "evil", Seq: 1, At: 1 << 62}})
+	if d, _ := g.Get("evil"); d.At > now {
+		t.Fatalf("future timestamp kept: %d", d.At)
+	}
+	now += int64(g.maxAge) + 1
+	g.Round(nil) // expiry runs on rounds
+	g.Round([]string{"x"})
+	if _, ok := g.Get("evil"); ok {
+		t.Fatal("a digest stamped in the future never expired")
+	}
+	var flood []Digest
+	for i := 0; i < maxTable+500; i++ {
+		flood = append(flood, Digest{Node: fmt.Sprint(i), Addr: fmt.Sprint("a", i), Seq: 1, At: now})
+	}
+	g.merge(flood)
+	if n := len(g.All()); n > maxTable+1 {
+		t.Fatalf("table grew to %d", n)
+	}
+	long := make([]byte, maxName+1)
+	g.merge([]Digest{{Node: "n", Addr: string(long), Seq: 1}})
+	if _, ok := g.Get(string(long)); ok {
+		t.Fatal("oversized address accepted")
+	}
+}

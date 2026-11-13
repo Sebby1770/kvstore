@@ -118,9 +118,12 @@ func (m Mbuf) Room() []byte {
 }
 
 // Len is the packet length.
+// The length word lives in shared memory, where a peer process may have
+// written anything: it is clamped to the data room on every read, so Data
+// can never slice past the buffer.
 func (m Mbuf) Len() int {
 	v, _ := m.p.r.Load64(m.off())
-	return int(uint32(v))
+	return min(int(uint32(v)), int(m.p.bufSize-mbufHeader))
 }
 
 // SetLen sets the packet length (clamped to the data room).

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Sebby1770/kvstore/kvgw/runtime/causal"
@@ -283,11 +284,109 @@ func FuzzDecodeDelta(f *testing.F) {
 	d, _ := s.Apply(Op{Name: "s", Kind: KindSet, Action: "add", Value: "v"})
 	b, _ := EncodeDelta(d)
 	f.Add(b)
+	// One seed per kind, plus hostile shapes, so mutation starts inside every
+	// decoder rather than having to invent a kind byte by byte.
+	for _, op := range []Op{
+		{Name: "c", Kind: KindCounter, Action: "add", Amount: -3},
+		{Name: "r", Kind: KindRegister, Action: "set", Value: "v"},
+		{Name: "m", Kind: KindMVRegister, Action: "set", Value: "v"},
+		{Name: "s", Kind: KindSet, Action: "remove", Value: "v"},
+	} {
+		d, _ := s.Apply(op)
+		b, _ := EncodeDelta(d)
+		f.Add(b)
+	}
+	f.Add([]byte(`{"name":"m","obj":{"kind":"mvregister","mvregister":{"vals":{"nocolon":"v","a:1":"w"},"ctx":{"vv":{"a":18446744073709551615},"cloud":[{"n":"a","s":0}]}}}}`))
+	f.Add([]byte(`{"name":"s","obj":{"kind":"set","counter":{"p":{"a":1}},"set":{"elems":{"e":[{"n":"a","s":3},{"n":"a","s":3}]},"ctx":{"cloud":[{"n":"a","s":2},{"n":"a","s":1}]}}}}`))
 	f.Fuzz(func(t *testing.T, b []byte) {
+		st := NewStore("me", func() hlc.Timestamp { return 1 })
+		// The snapshot path merges without DecodeDelta: it must be as safe.
+		var raw Delta
+		if json.Unmarshal(b, &raw) == nil && raw.Obj != nil {
+			st.Merge(raw)
+		}
 		d, err := DecodeDelta(b)
 		if err != nil {
 			return
 		}
-		NewStore("me", func() hlc.Timestamp { return 1 }).Merge(d)
+		st.Merge(d)
+		st.Merge(d) // idempotent, and safe on top of itself
+		st.Snapshot()
 	})
+}
+
+// Deltas no honest replica produces are rejected whole, never panic, and
+// leave the store untouched.
+func TestHostileDeltasRejected(t *testing.T) {
+	bigCloud := `[`
+	for i := 0; i < maxCloud+1; i++ {
+		if i > 0 {
+			bigCloud += ","
+		}
+		bigCloud += fmt.Sprintf(`{"n":"x","s":%d}`, 2*i+10)
+	}
+	bigCloud += `]`
+	for name, raw := range map[string]string{
+		"dot key without a colon": `{"name":"m","obj":{"kind":"mvregister","mvregister":{"vals":{"nocolon":"v"}}}}`,
+		"dot key with a bad seq":  `{"name":"m","obj":{"kind":"mvregister","mvregister":{"vals":{"a:notanumber":"v"}}}}`,
+		"empty dot key":           `{"name":"m","obj":{"kind":"mvregister","mvregister":{"vals":{"":"v"}}}}`,
+		"oversized cloud (set)":   `{"name":"m","obj":{"kind":"set","set":{"ctx":{"cloud":` + bigCloud + `}}}}`,
+		"oversized cloud (mvreg)": `{"name":"m","obj":{"kind":"mvregister","mvregister":{"ctx":{"cloud":` + bigCloud + `}}}}`,
+		"oversized element dots":  `{"name":"m","obj":{"kind":"set","set":{"elems":{"e":` + bigCloud + `}}}}`,
+	} {
+		if _, err := DecodeDelta([]byte(raw)); err == nil {
+			t.Errorf("%s: decoded", name)
+		}
+		// The snapshot path unmarshals without DecodeDelta: Merge must hold
+		// the line by itself.
+		var d Delta
+		if err := json.Unmarshal([]byte(raw), &d); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		s := NewStore("me", func() hlc.Timestamp { return 1 })
+		if err := s.Merge(d); err == nil {
+			t.Errorf("%s: merged", name)
+		}
+		if len(s.Names()) != 0 {
+			// The object may be created empty; it must hold nothing hostile.
+			if _, v, _ := s.Get("m"); fmt.Sprint(v) != "[]" {
+				t.Errorf("%s: rejected delta left state behind: %v", name, v)
+			}
+		}
+	}
+	// A populated field that does not match the declared kind is ignored.
+	var d Delta
+	json.Unmarshal([]byte(`{"name":"c","obj":{"kind":"counter","mvregister":{"vals":{"a:1":"v"}}}}`), &d)
+	s := NewStore("me", func() hlc.Timestamp { return 1 })
+	if err := s.Merge(d); err != nil {
+		t.Fatal(err)
+	}
+	if _, v, _ := s.Get("c"); v != int64(0) {
+		t.Fatalf("mismatched field leaked into the counter: %v", v)
+	}
+}
+
+// Many elements each under the per-element cap still cannot add up to an
+// object whose join would take billions of comparisons.
+func TestHostileDeltaTotalDots(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"name":"s","obj":{"kind":"set","set":{"elems":{`)
+	per := maxDots
+	for e := 0; e*per <= maxTotalDots; e++ {
+		if e > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `"e%d":[`, e)
+		for i := 0; i < per; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"n":"x","s":%d}`, e*per+i+1)
+		}
+		b.WriteString("]")
+	}
+	b.WriteString(`}}}}`)
+	if _, err := DecodeDelta([]byte(b.String())); err == nil || !strings.Contains(err.Error(), "more than") {
+		t.Fatalf("an oversized set decoded: %v", err)
+	}
 }

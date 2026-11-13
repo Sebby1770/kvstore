@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/Sebby1770/kvstore/kvgw/runtime/hlc"
@@ -263,17 +264,26 @@ type MVRegister struct {
 
 func dotKey(d Dot) string { return fmt.Sprintf("%s:%d", d.Node, d.Seq) }
 
-func parseDotKey(k string) Dot {
+// parseDotKey reverses dotKey. ok is false for anything dotKey could not
+// have produced (keys arrive from peers: they are validated, never trusted).
+func parseDotKey(k string) (d Dot, ok bool) {
 	i := strings.LastIndexByte(k, ':')
-	var s uint64
-	fmt.Sscan(k[i+1:], &s)
-	return Dot{Node: k[:i], Seq: s}
+	if i < 0 {
+		return Dot{}, false
+	}
+	s, err := strconv.ParseUint(k[i+1:], 10, 64)
+	if err != nil {
+		return Dot{}, false
+	}
+	return Dot{Node: k[:i], Seq: s}, true
 }
 
 func (m *MVRegister) dots() []Dot {
 	out := make([]Dot, 0, len(m.Vals))
 	for k := range m.Vals {
-		out = append(out, parseDotKey(k))
+		if d, ok := parseDotKey(k); ok {
+			out = append(out, d)
+		}
 	}
 	return out
 }
@@ -518,10 +528,64 @@ func (s *Store) Apply(op Op) (Delta, error) {
 	return Delta{Name: op.Name, Obj: d}, nil
 }
 
-// Merge joins a remote delta (or a full state from Snapshot).
+// Limits on what a peer's delta may carry. Joins compare dots pairwise, so
+// without them one oversized delta (a snapshot can be megabytes) would cost
+// quadratic time. Honest deltas are far below both: a cloud holds only dots
+// that arrived out of causal order, and an element or register carries one
+// dot per concurrent writer.
+const (
+	maxCloud     = 1024    // out-of-order dots in one causal context
+	maxDots      = 1024    // dots on one set element, or values in one MV register
+	maxTotalDots = 1 << 16 // dots across a whole object: joins check each against the cloud
+)
+
+// validate rejects deltas no honest replica produces, before they touch the
+// store: malformed dot keys and oversized dot collections.
+func (o *Object) validate() error {
+	ctx := func(c *Context) error {
+		if len(c.Cloud) > maxCloud {
+			return fmt.Errorf("crdt: causal context has %d out-of-order dots (limit %d)", len(c.Cloud), maxCloud)
+		}
+		return nil
+	}
+	if o.M != nil {
+		if len(o.M.Vals) > maxDots {
+			return fmt.Errorf("crdt: register has %d concurrent values (limit %d)", len(o.M.Vals), maxDots)
+		}
+		for k := range o.M.Vals {
+			if _, ok := parseDotKey(k); !ok {
+				return fmt.Errorf("crdt: malformed dot key %q", k)
+			}
+		}
+		if err := ctx(&o.M.Ctx); err != nil {
+			return err
+		}
+	}
+	if o.S != nil {
+		total := 0
+		for e, ds := range o.S.Elems {
+			if len(ds) > maxDots {
+				return fmt.Errorf("crdt: element %q has %d dots (limit %d)", e, len(ds), maxDots)
+			}
+			if total += len(ds); total > maxTotalDots {
+				return fmt.Errorf("crdt: set carries more than %d dots", maxTotalDots)
+			}
+		}
+		if err := ctx(&o.S.Ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Merge joins a remote delta (or a full state from Snapshot). A delta that
+// fails validation is rejected whole: the store is untouched.
 func (s *Store) Merge(d Delta) error {
 	if d.Obj == nil {
 		return errors.New("crdt: empty delta")
+	}
+	if err := d.Obj.validate(); err != nil {
+		return err
 	}
 	o, err := s.object(d.Name, d.Obj.Kind)
 	if err != nil {
@@ -575,6 +639,9 @@ func DecodeDelta(b []byte) (Delta, error) {
 		return Delta{}, errors.New("crdt: malformed delta")
 	}
 	if _, err := newObject(d.Obj.Kind); err != nil {
+		return Delta{}, err
+	}
+	if err := d.Obj.validate(); err != nil {
 		return Delta{}, err
 	}
 	return d, nil
