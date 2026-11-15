@@ -3,6 +3,8 @@ package segroute
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
+	"github.com/Sebby1770/kvstore/kvgw/netstack/wire"
 	"io"
 	"testing"
 	"testing/synctest"
@@ -108,6 +110,78 @@ func FuzzDecode(f *testing.F) {
 			if _, again, err := Decode(h.Encode(inner)); err != nil || string(again) != string(inner) {
 				t.Fatal("round trip")
 			}
+		}
+	})
+}
+
+// ---- regressions from the hostile-input audit ----
+
+// Nested headers cannot make one datagram loop through a relay: the relay
+// forwards only packets whose payload is KTP.
+func TestRelayRefusesNestedHeaders(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		n := simnet.New(1)
+		pc, _ := n.Listen("relay")
+		r := NewRelay(pc, simnet.Resolve)
+		defer r.Close()
+		inner := wire.AppendHeader(nil, wire.Header{Type: wire.OneRTTPacket, Version: 1})
+		pkt := inner
+		for i := 0; i < 2000; i++ {
+			pkt = Header{Left: 1, Segments: []string{"relay"}}.Encode(pkt)
+		}
+		src, _ := n.Listen("attacker")
+		src.WriteTo(pkt, simnet.Addr("relay"))
+		time.Sleep(time.Second)
+		if f := r.Stats().Forwarded; f > 1 {
+			t.Fatalf("one datagram was forwarded %d times", f)
+		}
+	})
+}
+
+// The flow table is bounded, and a live flow's return path stays with its
+// first previous hop.
+func TestRelayFlowTable(t *testing.T) {
+	n := simnet.New(1)
+	pc, _ := n.Listen("relay")
+	r := NewRelay(pc, simnet.Resolve)
+	defer r.Close()
+	now := time.Now()
+	honest, evil := simnet.Addr("honest"), simnet.Addr("evil")
+	var victim wire.ConnID
+	copy(victim[:], "victim!!")
+	r.learn(victim, honest, now)
+	r.learn(victim, evil, now.Add(time.Second))
+	if r.flows[victim].prev != honest {
+		t.Fatal("a spoofed packet took over a live flow's return path")
+	}
+	for i := 0; i < maxFlows+5000; i++ {
+		var cid wire.ConnID
+		copy(cid[:], fmt.Sprintf("%08d", i))
+		r.learn(cid, evil, now)
+	}
+	if f := r.Stats().Flows; f > maxFlows {
+		t.Fatalf("flow table grew to %d", f)
+	}
+	// Idle flows are reclaimed.
+	r.learn(victim, evil, now.Add(2*r.idle))
+	if r.flows[victim].prev != evil {
+		t.Fatal("an idle flow was never reclaimed")
+	}
+}
+
+func TestRelayAllow(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		n := simnet.New(1)
+		pc, _ := n.Listen("relay")
+		r := NewRelay(pc, simnet.Resolve)
+		r.Allow = func(a string) bool { return a == "ok" }
+		defer r.Close()
+		src, _ := n.Listen("src")
+		inner := wire.AppendHeader(nil, wire.Header{Type: wire.OneRTTPacket, Version: 1})
+		src.WriteTo(Header{Left: 1, Segments: []string{"victim"}}.Encode(inner), simnet.Addr("relay"))
+		time.Sleep(time.Second)
+		if st := r.Stats(); st.Forwarded != 0 || st.Dropped != 1 {
+			t.Fatalf("relay forwarded to a disallowed address: %+v", st)
 		}
 	})
 }

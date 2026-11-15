@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/binary"
 	"io"
 	"testing"
 	"testing/synctest"
@@ -273,4 +274,54 @@ func TestSegmentRoutedSubflow(t *testing.T) {
 		}
 		s.Close()
 	})
+}
+
+// ---- regressions from the hostile-input audit ----
+
+// A peer sending segments far ahead of anything delivered cannot make the
+// receiver hold more than the window.
+func TestReceiveWindowBounded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		r := newRig(t, map[string]simnet.Link{"a": {Latency: time.Millisecond}}, 9)
+		ctx := context.Background()
+		l := Listen(Config{}, r.server)
+		defer l.Close()
+		got := make(chan *Session, 1)
+		go func() { s, _ := l.Accept(ctx); got <- s }()
+		s, err := Dial(ctx, Config{}, r.paths("a")...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := <-got
+		chunk := make([]byte, 64<<10)
+		send := func(dsn uint64) {
+			rec := []byte{recData}
+			rec = binary.BigEndian.AppendUint64(rec, dsn)
+			rec = binary.BigEndian.AppendUint32(rec, uint32(len(chunk)))
+			if err := s.subflows[0].writeRecord(append(rec, chunk...)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i := 0; i < 64; i++ {
+			send(1<<40 + uint64(i)*uint64(len(chunk))) // far beyond the window
+		}
+		send(^uint64(0) - 10) // wrapping past 2^64
+		time.Sleep(time.Second)
+		st := srv.Stats()
+		srv.mu.Lock()
+		held := len(srv.ooo)
+		srv.mu.Unlock()
+		if held != 0 || st.OutOfWindow != 65 {
+			t.Fatalf("held %d out-of-window segments (stats %+v)", held, st)
+		}
+		s.Close()
+	})
+}
+
+func TestConfigClampedBelowWindow(t *testing.T) {
+	c := Config{SendBuffer: 1 << 40, SegmentSize: 1 << 30}
+	c.defaults()
+	if c.SendBuffer+c.SegmentSize > MaxWindow {
+		t.Fatalf("send buffer %d + segment %d exceeds the window", c.SendBuffer, c.SegmentSize)
+	}
 }

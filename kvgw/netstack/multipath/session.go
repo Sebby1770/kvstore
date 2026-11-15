@@ -74,13 +74,25 @@ type Config struct {
 	AckInterval  time.Duration // data-ACK period (default 5ms)
 }
 
+// MaxWindow is the receive window every session grants, a protocol
+// constant rather than a setting so both ends agree on it: a receiver keeps
+// at most this much beyond what its application has read, and drops segments
+// past it. Senders' buffers are clamped below it, so an honest sender never
+// reaches it; a hostile one cannot make the receiver hold more.
+const MaxWindow = 64 << 20
+
+// maxSegment is the largest segment a receiver accepts.
+const maxSegment = 1 << 20
+
 func (c *Config) defaults() {
 	if c.SegmentSize <= 0 {
 		c.SegmentSize = 16 << 10
 	}
+	c.SegmentSize = min(c.SegmentSize, maxSegment)
 	if c.SendBuffer <= 0 {
 		c.SendBuffer = 8 << 20
 	}
+	c.SendBuffer = min(c.SendBuffer, MaxWindow-maxSegment)
 	if c.StallTimeout <= 0 {
 		c.StallTimeout = 500 * time.Millisecond
 	}
@@ -191,6 +203,7 @@ type Stats struct {
 	Reinjected     uint64         `json:"reinjected_bytes"`
 	DupReceived    uint64         `json:"duplicate_bytes"`
 	Suspicions     uint64         `json:"suspicions"`
+	OutOfWindow    uint64         `json:"out_of_window"` // segments dropped beyond MaxWindow (a misbehaving peer)
 	Scheduler      string         `json:"scheduler"`
 	OutOfOrderPeak int            `json:"out_of_order_peak"`
 }
@@ -761,7 +774,7 @@ func (sf *subflow) readLoop() {
 				return
 			}
 			dsn, n := binary.BigEndian.Uint64(hdr), binary.BigEndian.Uint32(hdr[8:])
-			if int(n) > 1<<20 {
+			if int(n) > maxSegment {
 				sf.conn.CloseWithError(0x4d51, "segment too large")
 				return
 			}
@@ -785,6 +798,11 @@ func (sf *subflow) readLoop() {
 func (s *Session) receive(g *segment) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Beyond the window (or wrapping past 2^64): no honest sender gets here.
+	if limit := s.readTotal + MaxWindow; g.dsn > limit || uint64(len(g.data)) > limit-g.dsn {
+		s.stats.OutOfWindow++
+		return
+	}
 	s.stats.BytesReceived += uint64(len(g.data))
 	if g.fin {
 		s.gotFin, s.finDSN = true, g.dsn

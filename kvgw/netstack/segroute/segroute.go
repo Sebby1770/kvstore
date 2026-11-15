@@ -121,11 +121,25 @@ func (c *Conn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return len(b), nil
 }
 
+// maxFlows bounds a relay's flow table.
+const maxFlows = 65536
+
 // Relay forwards source-routed packets.
+//
+// A relay is unauthenticated by nature -- it sees only encrypted KTP -- so it
+// defends itself instead: it forwards only packets whose payload is a KTP
+// packet (so headers cannot be nested to make one datagram bounce through
+// relays thousands of times), its flow table is bounded, and a flow's return
+// path cannot be taken over by a packet from another address while the flow
+// is live. Set Allow to restrict where it may forward at all; without it, a
+// relay is an open relay for KTP-shaped packets.
 type Relay struct {
 	pc      net.PacketConn
 	resolve func(string) (net.Addr, error)
 	idle    time.Duration
+
+	// Allow, if set, reports whether the relay may forward to addr.
+	Allow func(addr string) bool
 
 	mu    sync.Mutex
 	flows map[wire.ConnID]flow
@@ -200,20 +214,20 @@ func (r *Relay) handle(b []byte, from net.Addr) {
 		r.dropped.Add(1)
 		return
 	}
-	// Remember the way back for this flow (the sender's connection ID).
-	if kh, err := wire.ParseHeader(inner); err == nil {
-		r.mu.Lock()
-		r.flows[kh.SrcCID] = flow{prev: from, seen: now}
-		if len(r.flows) > 65536 {
-			for k, f := range r.flows {
-				if now.Sub(f.seen) > r.idle {
-					delete(r.flows, k)
-				}
-			}
-		}
-		r.mu.Unlock()
+	// The payload must be a KTP packet. Anything else -- in particular
+	// another segment-routing header -- is refused: nested headers would let
+	// one datagram loop through relays once per layer.
+	kh, err := wire.ParseHeader(inner)
+	if err != nil {
+		r.dropped.Add(1)
+		return
 	}
 	next := h.Segments[len(h.Segments)-h.Left]
+	if r.Allow != nil && !r.Allow(next) {
+		r.dropped.Add(1)
+		return
+	}
+	r.learn(kh.SrcCID, from, now)
 	h.Left--
 	to, err := r.resolve(next)
 	if err != nil {
@@ -226,6 +240,33 @@ func (r *Relay) handle(b []byte, from net.Addr) {
 	}
 	r.pc.WriteTo(out, to)
 	r.forwarded.Add(1)
+}
+
+// learn records the way back for a flow (keyed by the sender's connection
+// ID). A live flow keeps its first previous hop: a packet from elsewhere
+// claiming the same connection ID cannot redirect its replies. The table is
+// bounded: when it is full of live flows, new ones are not learnt (their
+// replies are dropped) rather than letting a flood of spoofed IDs grow it.
+func (r *Relay) learn(cid wire.ConnID, from net.Addr, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if f, ok := r.flows[cid]; ok {
+		if f.prev.String() == from.String() || now.Sub(f.seen) > r.idle {
+			r.flows[cid] = flow{prev: from, seen: now}
+		}
+		return
+	}
+	if len(r.flows) >= maxFlows {
+		for k, f := range r.flows {
+			if now.Sub(f.seen) > r.idle {
+				delete(r.flows, k)
+			}
+		}
+		if len(r.flows) >= maxFlows {
+			return
+		}
+	}
+	r.flows[cid] = flow{prev: from, seen: now}
 }
 
 // Stats snapshots the relay.
