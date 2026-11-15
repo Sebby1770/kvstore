@@ -237,3 +237,38 @@ func FuzzHandle(f *testing.F) {
 		n.Tick()
 	})
 }
+
+// ---- regressions from the hostile-input audit ----
+
+// Messages are datagrams from cluster-key holders: a flood of invented
+// origins, messages far ahead of anything delivered, or oversized ones must
+// not grow state without bound.
+func TestHostileTrafficBounded(t *testing.T) {
+	n := New(Config{Self: "me"})
+	n.SetPeers([]string{"me", "peer"})
+	for i := 0; i < 10000; i++ {
+		n.Handle("peer", encodeData(Delivery{Origin: fmt.Sprintf("ghost%d", i), Seq: 1, Payload: []byte("x")}))
+	}
+	if got := len(n.Delivered()); got > maxOrigins {
+		t.Fatalf("tracking %d origins", got)
+	}
+	m := New(Config{Self: "me"})
+	m.SetPeers([]string{"me", "peer"})
+	for i := 0; i < 100; i++ {
+		m.Handle("peer", encodeData(Delivery{Origin: "peer", Seq: uint64(1_000_000 + i), Payload: []byte("x")}))
+	}
+	if st := m.Stats(); st.Buffered != 0 {
+		t.Fatalf("buffered %d messages far beyond the delivery window", st.Buffered)
+	}
+	big := encodeData(Delivery{Origin: "peer", Seq: 1, Payload: make([]byte, 4000)})
+	if err := m.Handle("peer", big); err == nil || len(m.Deliveries()) != 0 {
+		t.Fatal("an oversized message was accepted")
+	}
+	deps := VC{}
+	for i := 0; i < 1000; i++ {
+		deps[fmt.Sprint("d", i)] = 1
+	}
+	if err := m.Handle("peer", encodeData(Delivery{Origin: "peer", Seq: 1, Deps: deps})); err == nil {
+		t.Fatal("a message naming 1000 dependencies was accepted")
+	}
+}

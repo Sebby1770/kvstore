@@ -3,6 +3,7 @@ package vtime
 import (
 	"encoding/binary"
 	"errors"
+	"time"
 )
 
 // Time-transfer messages travel as Raw datagrams tagged TagPTP:
@@ -119,8 +120,26 @@ func (f *Follower) Adopt(epoch uint32) {
 
 // HandleSync records a SYNC's arrival and returns the DELAY_REQ to send
 // immediately.
+// MaxOffset bounds how far a master's timestamp may be from our own clock.
+// Honest clocks are seconds apart at worst; anything beyond a day is a
+// broken or hostile master, and accepting it would step the clock (and every
+// hybrid logical clock reading it) to an absurd time. The bound also keeps
+// the offset arithmetic far from int64 overflow.
+const MaxOffset = 24 * time.Hour
+
+func near(a, b int64) bool {
+	d := a - b
+	if (a >= 0) != (b >= 0) && (d >= 0) != (a >= 0) {
+		return false // the subtraction overflowed: certainly not near
+	}
+	return d <= int64(MaxOffset) && d >= -int64(MaxOffset)
+}
+
 func (f *Follower) HandleSync(m Message) (Message, bool) {
 	if m.Type != MsgSync || m.Epoch != f.epoch {
+		return Message{}, false
+	}
+	if !near(m.Time, f.clock.Now()) {
 		return Message{}, false
 	}
 	f.seq, f.t1, f.t2 = m.Seq, m.Time, f.clock.Now()
@@ -136,6 +155,9 @@ func (f *Follower) HandleDelayResp(m Message) bool {
 		return false
 	}
 	f.open = false
+	if !near(m.Time, f.t3) {
+		return false
+	}
 	t4 := m.Time
 	fwd, back := f.t2-f.t1, t4-f.t3
 	s := sample{theta: (fwd - back) / 2, delta: (fwd + back) / 2}

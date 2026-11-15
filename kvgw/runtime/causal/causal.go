@@ -192,6 +192,16 @@ func (n *Node) Handle(from string, b []byte) error {
 			n.stats.Malformed++
 			return err
 		}
+		// What Broadcast would never send is refused: oversized payloads,
+		// and dependency lists longer than any real cluster.
+		if len(d.Payload) > n.cfg.MaxPayload {
+			n.stats.Malformed++
+			return ErrTooLarge
+		}
+		if len(d.Deps) > maxDeps {
+			n.stats.Malformed++
+			return errMalformed
+		}
 		n.receive(d, b)
 	case msgDigest:
 		sender, vc, err := decodeDigest(b)
@@ -207,9 +217,29 @@ func (n *Node) Handle(from string, b []byte) error {
 	return nil
 }
 
+// Bounds on what peers' messages can make a node track. Datagrams come from
+// cluster-key holders, so these are defences against a misbehaving member,
+// sized far above any honest cluster.
+const (
+	maxOrigins = 4096 // distinct origins tracked
+	maxDeps    = 256  // dependencies named by one message
+)
+
 func (n *Node) receive(d Delivery, enc []byte) {
-	if d.Origin == n.cfg.Self || d.Seq <= n.delivered[d.Origin] {
+	have, known := n.delivered[d.Origin]
+	if d.Origin == n.cfg.Self || d.Seq <= have {
 		n.stats.Duplicates++
+		return
+	}
+	if !known && n.buffer[d.Origin] == nil && len(n.delivered)+len(n.buffer) >= maxOrigins {
+		n.stats.Overflow++
+		return
+	}
+	// Far ahead of delivery: it cannot be delivered before everything in
+	// between, which anti-entropy will push in order -- holding it buys
+	// nothing and lets a peer park junk in the buffer.
+	if d.Seq-have > uint64(n.cfg.MaxBuffer) {
+		n.stats.Overflow++
 		return
 	}
 	if q := n.buffer[d.Origin]; q != nil {
@@ -429,7 +459,7 @@ func (r *reader) str() string { return string(r.bytes(r.varint())) }
 
 func (r *reader) vc() VC {
 	n := r.varint()
-	if n > 1024 {
+	if n > maxOrigins {
 		r.err = true
 		return nil
 	}

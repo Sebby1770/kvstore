@@ -278,3 +278,22 @@ func TestGossipRejectsHostileDigests(t *testing.T) {
 		t.Fatal("oversized address accepted")
 	}
 }
+
+// A flood of cancel signals neither grows the tombstone table without bound
+// nor costs quadratic time.
+func TestCancelFloodBounded(t *testing.T) {
+	r := NewRegistry(nil)
+	start := time.Now()
+	for i := 0; i < 100000; i++ {
+		r.Cancel(fmt.Sprintf("%016x", i))
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("100k cancels took %v", d)
+	}
+	r.mu.Lock()
+	n := len(r.tomb)
+	r.mu.Unlock()
+	if n > maxTombstones {
+		t.Fatalf("%d tombstones kept", n)
+	}
+}

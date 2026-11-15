@@ -13,13 +13,20 @@ import (
 // executions so a cancel signal can stop them, and remembers cancelled IDs
 // so a copy that arrives after its cancel is refused instead of run.
 type Registry struct {
-	mu      sync.Mutex
-	running map[string][]context.CancelFunc
-	tomb    map[string]time.Time
-	ttl     time.Duration
-	gossip  *Gossip
-	stats   RegistryStats
+	mu        sync.Mutex
+	running   map[string][]context.CancelFunc
+	tomb      map[string]time.Time
+	ttl       time.Duration
+	lastPrune time.Time
+	gossip    *Gossip
+	stats     RegistryStats
 }
+
+// maxTombstones bounds remembered cancellations. Cancel signals come from
+// cluster-key holders; a tombstone only saves a late copy's work (every
+// speculated call is idempotent), so when the table is full new ones are
+// simply not kept.
+const maxTombstones = 16384
 
 // RegistryStats counts server-side speculation.
 type RegistryStats struct {
@@ -66,12 +73,19 @@ func (r *Registry) Cancel(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now()
-	for k, t := range r.tomb {
-		if now.Sub(t) > r.ttl {
-			delete(r.tomb, k)
+	// Expire at most once a second: sweeping on every cancel made a flood
+	// of them cost quadratic time.
+	if now.Sub(r.lastPrune) > time.Second {
+		r.lastPrune = now
+		for k, t := range r.tomb {
+			if now.Sub(t) > r.ttl {
+				delete(r.tomb, k)
+			}
 		}
 	}
-	r.tomb[id] = now
+	if len(r.tomb) < maxTombstones {
+		r.tomb[id] = now
+	}
 	for _, c := range r.running[id] {
 		c()
 		r.stats.Cancelled++

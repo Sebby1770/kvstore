@@ -2,6 +2,7 @@ package vtime
 
 import (
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"reflect"
 	"testing"
@@ -261,4 +262,22 @@ func FuzzDecode(f *testing.F) {
 			}
 		}
 	})
+}
+
+// A grandmaster's timestamps are untrusted numbers: absurd ones (an int64
+// extreme, days away from our clock) are refused, not folded into the clock.
+func TestFollowerRejectsAbsurdTimestamps(t *testing.T) {
+	now := int64(1_700_000_000 * time.Second)
+	c := NewClock(func() int64 { return now }, 0)
+	f := NewFollower(c, 8)
+	f.Adopt(1)
+	for _, ts := range []int64{math.MinInt64, math.MaxInt64, now - int64(72*time.Hour), now + int64(72*time.Hour)} {
+		req, ok := f.HandleSync(Message{Type: MsgSync, Seq: 1, Time: ts, Epoch: 1})
+		if ok {
+			f.HandleDelayResp(Message{Type: MsgDelayResp, Seq: req.Seq, Time: ts, Epoch: 1})
+		}
+		if got := c.Now(); got < now-int64(time.Second) || got > now+int64(time.Second) {
+			t.Fatalf("timestamp %d moved the clock to %d", ts, got)
+		}
+	}
 }
