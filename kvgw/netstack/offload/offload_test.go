@@ -605,3 +605,32 @@ func TestDegenerateMapsAreSafe(t *testing.T) {
 	NewAddrMap("a", -1)
 	NewQueueMap("q", -1, -1)
 }
+
+// The built-in programs face unauthenticated packets: any bytes, any peer
+// key, and clocks that may jump backwards between packets.
+func FuzzBuiltinPrograms(f *testing.F) {
+	f.Add([]byte{0x10, 1}, uint64(1), int64(1e9), int64(-5e8))
+	f.Add(make([]byte, HeartbeatSize), uint64(7), int64(1), int64(1))
+	probe := make([]byte, HeartbeatSize)
+	probe[0] = hbProbe
+	f.Add(probe, uint64(9), int64(1<<62), int64(-1<<62))
+	f.Add([]byte{0x50}, uint64(3), int64(5), int64(0))
+	rl, _ := NewRateLimiter(3, 2)
+	cb, _ := NewCircuitBreaker(2, time.Second)
+	hb, _ := NewHeartbeat([]byte("k"))
+	mg, _ := NewMaglev(4)
+	mg.SetBackends([]string{"a", "b"}, []net.Addr{simnet.Addr("a"), simnet.Addr("b")})
+	progs := []*Loaded{rl.Prog, cb.Ingress, cb.Egress, hb.Prog, mg.Prog}
+	f.Fuzz(func(t *testing.T, pkt []byte, peer uint64, now, step int64) {
+		for _, l := range progs {
+			for i := 0; i < 3; i++ { // the same peer, time moving by step
+				l.Run(&Input{Packet: append([]byte(nil), pkt...), PeerKey: peer, Now: now + int64(i)*step, Egress: l == cb.Egress})
+			}
+		}
+		for _, l := range progs {
+			if st := l.Stats(); st.Faults != 0 {
+				t.Fatalf("%s faulted on a packet: %+v", l.Name(), st)
+			}
+		}
+	})
+}
