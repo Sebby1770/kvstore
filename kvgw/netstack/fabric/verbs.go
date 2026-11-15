@@ -29,6 +29,12 @@ const (
 	// transfers are split into several verbs issued concurrently. It keeps
 	// every verb inside one KTP datagram.
 	MaxTransfer = 1024
+
+	// MaxChaseHops bounds one CHASE walk. The owner runs the walk in its
+	// packet path, under its endpoint's lock, so the bound is what keeps one
+	// datagram from freezing the endpoint: an attacker who picks the link
+	// offset can make any linked structure a cycle.
+	MaxChaseHops = 1024
 )
 
 // Verb opcodes.
@@ -183,7 +189,7 @@ func execute(q request, reg *Region, perm Perm) response {
 		le.PutUint64(r[16:], prev)
 		return r
 	case OpChase:
-		if q.readLen() > MaxTransfer || q.length() == 0 {
+		if q.readLen() > MaxTransfer || q.length() == 0 || q.length() > MaxChaseHops {
 			return newResponse(q, stMalformed, 0)
 		}
 		res, err := reg.Chase(q.offset(), ChaseSpec{LinkOff: q.linkOff(), KeyOff: q.keyOff(), Key: q.arg0(),

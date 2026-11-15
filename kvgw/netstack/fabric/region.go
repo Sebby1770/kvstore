@@ -237,6 +237,7 @@ type ChaseResult struct {
 // Chase walks the structure starting at node offset start.
 func (r *Region) Chase(start uint64, s ChaseSpec) (ChaseResult, error) {
 	var res ChaseResult
+	s.MaxHops = min(s.MaxHops, MaxChaseHops)
 	off := start
 	for off != 0 && res.Hops < s.MaxHops {
 		if s.Match {

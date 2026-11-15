@@ -86,7 +86,18 @@ func OpenIndex(ctx context.Context, n *Node, rr Remote) (*Index, error) {
 	if le.Uint64(hdr) != indexMagic {
 		return nil, ErrNotIndex
 	}
-	return &Index{n: n, rr: rr, buckets: le.Uint64(hdr[8:]), capacity: le.Uint64(hdr[24:])}, nil
+	// The header is whatever the region holds -- written by its owner, or by
+	// anyone with write access -- so it is checked before it is used: a
+	// zero bucket count would divide by zero, and buckets or a capacity
+	// beyond the region would send every operation out of bounds.
+	buckets, capacity := le.Uint64(hdr[8:]), le.Uint64(hdr[24:])
+	if rr.Size != 0 && capacity > rr.Size {
+		return nil, ErrNotIndex
+	}
+	if capacity < indexHeader+8 || buckets == 0 || buckets > (capacity-indexHeader)/8 {
+		return nil, ErrNotIndex
+	}
+	return &Index{n: n, rr: rr, buckets: buckets, capacity: capacity}, nil
 }
 
 func keyHash(k []byte) uint64 {
@@ -115,6 +126,11 @@ func (x *Index) insert(ctx context.Context, key, value []byte, vlen uint32) erro
 	off, err := x.n.FetchAdd(ctx, x.rr, 16, size)
 	if err != nil {
 		return err
+	}
+	// The cursor is shared memory too: an allocation inside the header or
+	// bucket array (or wrapping around) would overwrite the index itself.
+	if off < indexHeader+8*x.buckets || off+size < off {
+		return ErrNotIndex
 	}
 	if off+size > x.capacity {
 		return ErrIndexFull

@@ -78,7 +78,7 @@ type Node struct {
 	dpos  int
 
 	pmu     sync.Mutex
-	pending map[uint64]chan response
+	pending map[uint64]*pendingVerb
 	nextReq atomic.Uint64
 
 	served, issued, local, retries, dedupHits, denied atomic.Uint64
@@ -97,7 +97,7 @@ func New(ep *endpoint.Endpoint, opts Options) *Node {
 		opts.DedupEntries = 4096
 	}
 	n := &Node{ep: ep, opts: opts, regions: map[uint16]*regEntry{}, nextID: 1,
-		dedup: map[dedupKey]response{}, dring: make([]dedupKey, opts.DedupEntries), pending: map[uint64]chan response{}}
+		dedup: map[dedupKey]response{}, dring: make([]dedupKey, opts.DedupEntries), pending: map[uint64]*pendingVerb{}}
 	var seed [8]byte
 	rand.Read(seed[:])
 	n.nextReq.Store(binary.LittleEndian.Uint64(seed[:]) >> 1)
@@ -199,20 +199,32 @@ func (n *Node) serve(c *endpoint.Conn, p []byte) []byte {
 	return r
 }
 
+// pendingVerb is a verb waiting for its response. The response must come
+// back on the connection the request went out on, for the same operation:
+// request ids are a counter, so any other peer that saw one of our requests
+// could otherwise predict the next ids and answer them -- forging READ data,
+// CAS outcomes or FETCH_ADD allocations for memory it has no rights to.
+type pendingVerb struct {
+	conn *endpoint.Conn
+	op   byte
+	ch   chan response
+}
+
 // complete hands a response to the verb waiting for it.
-func (n *Node) complete(_ *endpoint.Conn, p []byte) []byte {
+func (n *Node) complete(c *endpoint.Conn, p []byte) []byte {
 	if len(p) < respHeader {
 		return nil
 	}
 	r := response(append([]byte(nil), p...))
 	n.pmu.Lock()
-	ch := n.pending[r.id()]
+	pv := n.pending[r.id()]
 	n.pmu.Unlock()
-	if ch != nil {
-		select {
-		case ch <- r:
-		default: // a duplicate of a response already delivered
-		}
+	if pv == nil || pv.conn != c || pv.op != r[1] {
+		return nil // not ours, from the wrong peer, or for another verb
+	}
+	select {
+	case pv.ch <- r:
+	default: // a duplicate of a response already delivered
 	}
 	return nil
 }
@@ -244,7 +256,7 @@ func (n *Node) do(ctx context.Context, rr Remote, q request) (response, error) {
 	q.setID(id)
 	ch := make(chan response, 1)
 	n.pmu.Lock()
-	n.pending[id] = ch
+	n.pending[id] = &pendingVerb{conn: conn, op: q.op(), ch: ch}
 	n.pmu.Unlock()
 	defer func() {
 		n.pmu.Lock()
@@ -370,7 +382,7 @@ func (n *Node) FetchAdd(ctx context.Context, rr Remote, off, delta uint64) (uint
 // Chase walks a linked structure on the owner, starting at node offset
 // start, and returns where it ended -- one round trip however many hops.
 func (n *Node) Chase(ctx context.Context, rr Remote, start uint64, s ChaseSpec) (ChaseResult, error) {
-	if s.ReadLen > MaxTransfer {
+	if s.ReadLen > MaxTransfer || s.MaxHops > MaxChaseHops {
 		return ChaseResult{}, ErrTooLarge
 	}
 	if s.MaxHops == 0 {

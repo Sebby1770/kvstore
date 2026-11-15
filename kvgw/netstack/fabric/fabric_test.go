@@ -406,3 +406,128 @@ func FuzzServe(f *testing.F) {
 		n.complete(nil, b)
 	})
 }
+
+// ---- regressions from the hostile-input audit ----
+
+// One CHASE may not walk without bound: the owner runs it under its
+// endpoint lock, and any linked structure becomes a cycle if the attacker
+// picks the link offset.
+func TestChaseHopsBounded(t *testing.T) {
+	reg := NewRegion(64)
+	reg.Store64(8, 8) // a node whose next pointer is itself
+	n := New(nil, Options{})
+	rr := n.Register(reg, PermRead)
+	q := newRequest(OpChase, rr, 8, 0)
+	le.PutUint32(q[24:], 0xFFFFFFFF)
+	done := make(chan response, 1)
+	go func() { done <- n.serve(nil, q) }()
+	select {
+	case r := <-done:
+		if r.status() != stMalformed {
+			t.Fatalf("status %d, want the oversized walk refused", r.status())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("one CHASE datagram kept the owner busy")
+	}
+	res, err := reg.Chase(8, ChaseSpec{MaxHops: 0xFFFFFFFF})
+	if err != nil || res.Hops != MaxChaseHops {
+		t.Fatalf("local walk: %d hops, %v (want clamped to %d)", res.Hops, err, MaxChaseHops)
+	}
+	if _, err := n.Chase(context.Background(), rr, 8, ChaseSpec{MaxHops: MaxChaseHops + 1}); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("client sent an oversized walk: %v", err)
+	}
+}
+
+// An index header is untrusted memory: a zero or oversized bucket count, a
+// capacity past the region, or a cursor inside the header is refused.
+func TestOpenIndexRejectsHostileHeader(t *testing.T) {
+	ctx := context.Background()
+	for name, poison := range map[string]func(r *Region){
+		"zero buckets":         func(r *Region) { r.Store64(8, 0) },
+		"too many buckets":     func(r *Region) { r.Store64(8, 1<<40) },
+		"capacity past region": func(r *Region) { r.Store64(24, 1<<40) },
+		"tiny capacity":        func(r *Region) { r.Store64(24, 8) },
+	} {
+		reg := NewRegion(4096)
+		FormatIndex(reg, 4)
+		poison(reg)
+		n := New(nil, Options{})
+		if _, err := OpenIndex(ctx, n, n.Register(reg, PermAll)); !errors.Is(err, ErrNotIndex) {
+			t.Errorf("%s: OpenIndex = %v, want ErrNotIndex", name, err)
+		}
+	}
+	reg := NewRegion(4096)
+	FormatIndex(reg, 4)
+	n := New(nil, Options{})
+	x, err := OpenIndex(ctx, n, n.Register(reg, PermAll))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.Store64(16, 8) // cursor pointing into the header
+	if err := x.Put(ctx, []byte("k"), []byte("v")); !errors.Is(err, ErrNotIndex) {
+		t.Fatalf("Put with a hostile cursor: %v", err)
+	}
+	if v, _ := reg.Load64(0); v != indexMagic {
+		t.Fatal("the hostile cursor let Put overwrite the header")
+	}
+}
+
+// A response is accepted only from the connection the request went out on:
+// a third peer that has seen our request ids cannot answer for the owner.
+func TestResponsesOnlyFromTheOwner(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newCluster(t, 3, simnet.Link{Latency: time.Millisecond})
+		defer c.close()
+		owner, attacker, victim := c.nodes[0], c.nodes[1], c.nodes[2]
+		reg := NewRegion(4096)
+		FormatIndex(reg, 16)
+		rr := owner.Register(reg, PermAll)
+		ctx := context.Background()
+		// The victim already talks to the owner (an established connection,
+		// so its next request is registered at once).
+		if _, err := victim.Read(ctx, rr, 0, 8); err != nil {
+			t.Fatal(err)
+		}
+		// The attacker learns the victim's request ids by being sent one.
+		seen := make(chan uint64, 4)
+		attacker.ep.HandleDatagrams(TagRequest, func(_ *endpoint.Conn, p []byte) []byte {
+			if len(p) >= reqHeader {
+				select {
+				case seen <- request(p).id():
+				default:
+				}
+			}
+			return nil
+		})
+		rctx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+		victim.Read(rctx, Remote{Addr: "n1", Region: 1, Key: 1}, 0, 8)
+		cancel()
+		last := <-seen
+		c.net.SetLink("n0", "n2", simnet.Link{Latency: 200 * time.Millisecond}) // the owner is slow
+		conn, err := attacker.ep.Conn(ctx, "n2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { // spray forged headers for the next ids
+			for round := 0; round < 15; round++ {
+				for id := last + 1; id < last+8; id++ {
+					f := make([]byte, respHeader+indexHeader)
+					f[0], f[1], f[2] = TagResponse, OpRead, stOK
+					le.PutUint64(f[8:], id)
+					le.PutUint64(f[respHeader:], indexMagic)
+					le.PutUint64(f[respHeader+8:], 1)
+					le.PutUint64(f[respHeader+24:], 4096)
+					conn.SendDatagram(f)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+		x, err := OpenIndex(ctx, victim, rr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if x.buckets != 16 {
+			t.Fatalf("victim took a forged header from a third peer: %d buckets", x.buckets)
+		}
+	})
+}
