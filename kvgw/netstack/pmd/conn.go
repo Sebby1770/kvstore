@@ -2,6 +2,7 @@ package pmd
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -67,6 +68,13 @@ func (c *PacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		if n := c.port.RxBurst(c.burst); n > 0 {
 			c.pending = append(c.pending[:0], c.burst[:n]...)
 			continue
+		}
+		// A port whose peer wedged it will never deliver again: report the
+		// link closed rather than poll it for ever.
+		if e, ok := c.port.(interface{ Err() error }); ok {
+			if err := e.Err(); err != nil {
+				return 0, nil, fmt.Errorf("%w: %v", net.ErrClosed, err)
+			}
 		}
 		c.idle.Idle()
 	}

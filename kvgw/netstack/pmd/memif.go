@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -65,6 +66,28 @@ type MemifPort struct {
 	creator bool
 	idx     []uint64
 	stats   PortStats
+
+	// mu keeps Close from unmapping the file under a burst in flight.
+	mu     sync.RWMutex
+	closed bool
+}
+
+// MemifPeerTimeout bounds how long a memif operation waits on the peer
+// process before declaring the interface wedged (see Ring.SetPeerTimeout).
+const MemifPeerTimeout = 250 * time.Millisecond
+
+func (m *MemifPort) bound() {
+	for _, q := range []*Ring{m.tx, m.rx, m.pool.free} {
+		q.SetPeerTimeout(MemifPeerTimeout)
+	}
+}
+
+// Err reports a peer that wedged the interface (nil while it works).
+func (m *MemifPort) Err() error {
+	if m.tx.Wedged() || m.rx.Wedged() || m.pool.free.Wedged() {
+		return ErrRingWedged
+	}
+	return nil
 }
 
 // PortStats counts a port's traffic.
@@ -107,6 +130,7 @@ func CreateMemif(path string, cfg MemifConfig) (*MemifPort, error) {
 	r.Store64(16, uint64(cfg.RingSize))
 	r.Store64(24, uint64(cfg.Buffers))
 	r.Store64(32, uint64(cfg.DataRoom))
+	m.bound()
 	r.Store64(0, memifMagic) // publish: everything above is now visible
 	return m, nil
 }
@@ -161,6 +185,7 @@ func tryOpenMemif(path string) (*MemifPort, error) {
 	if err != nil {
 		return fail(err)
 	}
+	m.bound()
 	return m, nil
 }
 
@@ -170,6 +195,11 @@ func (m *MemifPort) Pool() *Pool { return m.pool }
 // RxBurst receives packets in place: the returned mbufs are the very
 // buffers the peer wrote.
 func (m *MemifPort) RxBurst(bufs []Mbuf) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0
+	}
 	if cap(m.idx) < len(bufs) {
 		m.idx = make([]uint64, len(bufs))
 	}
@@ -191,6 +221,11 @@ func (m *MemifPort) RxBurst(bufs []Mbuf) int {
 
 // TxBurst hands buffers to the peer by enqueuing their indices.
 func (m *MemifPort) TxBurst(bufs []Mbuf) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0
+	}
 	var stack [64]uint64
 	idx := stack[:0]
 	for _, b := range bufs {
@@ -209,4 +244,14 @@ func (m *MemifPort) Stats() PortStats {
 }
 
 // Close unmaps this side.
-func (m *MemifPort) Close() error { return m.r.Close() }
+// Close unmaps this side once in-flight bursts have finished (they are
+// bounded by MemifPeerTimeout). Mbufs and the Pool must not be used after.
+func (m *MemifPort) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
+	m.closed = true
+	return m.r.Close()
+}

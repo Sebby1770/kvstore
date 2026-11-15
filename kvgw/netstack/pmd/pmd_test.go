@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -468,5 +470,99 @@ func TestMbufLengthFromPeerIsClamped(t *testing.T) {
 	r.Store64(m.off(), 1<<31) // what a hostile peer might write
 	if n := len(m.Data()); n != len(m.Room()) {
 		t.Fatalf("Data() is %d bytes, room %d", n, len(m.Room()))
+	}
+}
+
+// ---- regressions from the hostile-input audit ----
+
+func within(t *testing.T, d time.Duration, what string, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { defer close(done); f() }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s did not return within %v", what, d)
+	}
+}
+
+// A peer that reserves ring slots and never commits wedges a shared ring;
+// it cannot hang us.
+func TestSharedRingPeerCannotHang(t *testing.T) {
+	r := fabric.NewRegion(int(RingBytes(16)))
+	q, _ := FormatRing(r, 0, 16)
+	q.SetPeerTimeout(50 * time.Millisecond)
+	atomic.StoreUint64(q.prodHead, 5) // the peer reserved 5 slots, never committed
+	within(t, 2*time.Second, "Enqueue", func() {
+		if n := q.Enqueue([]uint64{1}); n != 0 {
+			t.Errorf("enqueued %d onto a wedged ring", n)
+		}
+	})
+	if !q.Wedged() {
+		t.Fatal("ring not reported wedged")
+	}
+	r2 := fabric.NewRegion(int(RingBytes(16)))
+	q2, _ := FormatRing(r2, 0, 16)
+	q2.SetPeerTimeout(50 * time.Millisecond)
+	atomic.StoreUint64(q2.prodHead, 4)
+	atomic.StoreUint64(q2.prodTail, 4)
+	atomic.StoreUint64(q2.consHead, 2) // the peer claimed 2, never released
+	within(t, 2*time.Second, "Dequeue", func() { q2.Dequeue(make([]uint64, 4)) })
+	// Nonsense indices (consumer far ahead of producer) end the same way.
+	r3 := fabric.NewRegion(int(RingBytes(16)))
+	q3, _ := FormatRing(r3, 0, 16)
+	q3.SetPeerTimeout(50 * time.Millisecond)
+	atomic.StoreUint64(q3.consTail, 1<<40)
+	within(t, 2*time.Second, "Enqueue on nonsense indices", func() { q3.Enqueue([]uint64{1}) })
+}
+
+// Through a memif: a wedged ring makes WriteTo drop and ReadFrom report the
+// link closed, promptly.
+func TestMemifWedgedByPeer(t *testing.T) {
+	a, b := memifPair(t, MemifConfig{RingSize: 16, Buffers: 64, DataRoom: 256})
+	atomic.StoreUint64(a.rx.prodHead, 3) // hostile write into b's tx ring
+	c := NewPacketConn(b, "b", "a")
+	within(t, 3*time.Second, "WriteTo", func() { c.WriteTo([]byte("hi"), nil) })
+	atomic.StoreUint64(a.tx.prodHead, 3) // and into b's rx ring
+	within(t, 3*time.Second, "ReadFrom", func() {
+		_, _, err := c.ReadFrom(make([]byte, 64))
+		if !errors.Is(err, net.ErrClosed) {
+			t.Errorf("ReadFrom on a wedged memif: %v", err)
+		}
+	})
+	if b.Err() == nil {
+		t.Fatal("memif not reported wedged")
+	}
+}
+
+// A peer handing us a buffer that is already free (a double free) cannot
+// make Put spin: the duplicate is dropped and counted.
+func TestDoubleFreeFromPeerIsDropped(t *testing.T) {
+	a, b := memifPair(t, MemifConfig{RingSize: 16, Buffers: 16, DataRoom: 256})
+	a.tx.Enqueue([]uint64{0}) // buffer 0 is free, never handed out
+	c := NewPacketConn(b, "b", "a")
+	within(t, 3*time.Second, "ReadFrom", func() { c.ReadFrom(make([]byte, 512)) })
+	if st := b.Pool().Stats(); st.Dropped != 1 {
+		t.Fatalf("pool stats %+v, want the double free dropped", st)
+	}
+}
+
+// Indices read back from a shared free ring are validated before use.
+func TestPoolRejectsOutOfRangeIndices(t *testing.T) {
+	cfg := MemifConfig{RingSize: 16, Buffers: 16, DataRoom: 8192}
+	a, b := memifPair(t, cfg)
+	drain := make([]uint64, 16)
+	a.pool.free.Dequeue(drain)
+	a.pool.free.Enqueue([]uint64{uint64(cfg.Buffers), 1 << 33, 3})
+	m, err := b.Pool().Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Index() != 3 {
+		t.Fatalf("Get handed out index %d", m.Index())
+	}
+	_ = m.Data()
+	if st := b.Pool().Stats(); st.Bad != 2 {
+		t.Fatalf("pool stats %+v, want 2 bad indices", st)
 	}
 }

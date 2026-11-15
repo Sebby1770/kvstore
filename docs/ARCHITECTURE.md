@@ -533,7 +533,8 @@ response tag | op | status | flags | hops | request id | value (previous / end o
   wrote it. The tests check zero copies (same buffer index on both sides),
   exchange packets with a child process through shared memory alone, and
   run the whole KTP stack over memif (a 2 MiB stream). In the in-process
-  benchmark a packet costs about 7 ns.
+  benchmark a packet costs under 10 ns. A peer process that stops committing (dead
+  or hostile) wedges the interface after 250 ms instead of hanging this side.
 * `Lcore` is a run-to-completion poll loop pinned with LockOSThread. Its
   `Idler` busy-polls while traffic flows, then yields, then sleeps in steps
   up to 1 ms.

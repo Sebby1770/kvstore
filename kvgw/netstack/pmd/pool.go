@@ -2,6 +2,8 @@ package pmd
 
 import (
 	"errors"
+	"runtime"
+	"sync/atomic"
 
 	"github.com/Sebby1770/kvstore/kvgw/netstack/fabric"
 )
@@ -19,6 +21,20 @@ type Pool struct {
 	base    uint64
 	bufSize uint64
 	count   int
+
+	bad, dropped atomic.Uint64
+}
+
+// PoolStats counts what a pool refused.
+type PoolStats struct {
+	Free    int    // buffers free now
+	Bad     uint64 // out-of-range indices read from the free ring (a corrupt or hostile peer)
+	Dropped uint64 // frees refused because the free ring was full or wedged (a double free)
+}
+
+// Stats snapshots the pool.
+func (p *Pool) Stats() PoolStats {
+	return PoolStats{Free: p.Free(), Bad: p.bad.Load(), Dropped: p.dropped.Load()}
 }
 
 const (
@@ -133,7 +149,10 @@ func (m Mbuf) SetLen(n int) {
 }
 
 // Data is the packet, in place.
-func (m Mbuf) Data() []byte { return m.Room()[:m.Len()] }
+func (m Mbuf) Data() []byte {
+	r := m.Room()
+	return r[:min(m.Len(), len(r))]
+}
 
 // Aux is a free word for the owner (SocketPort keeps the peer address
 // slot there).
@@ -146,25 +165,40 @@ func (m Mbuf) Aux() uint64 {
 func (m Mbuf) SetAux(v uint64) { m.p.r.Store64(m.off()+8, v) }
 
 // Get takes a free buffer.
+// The free ring may be shared with another process, so every index read
+// from it is checked: an out-of-range one is counted and skipped, never
+// turned into a buffer.
 func (p *Pool) Get() (Mbuf, error) {
 	var idx [1]uint64
-	if p.free.Dequeue(idx[:]) == 0 {
-		return Mbuf{}, ErrPoolEmpty
+	for tries := 0; tries < 8; tries++ {
+		if p.free.Dequeue(idx[:]) == 0 {
+			return Mbuf{}, ErrPoolEmpty
+		}
+		if m, ok := p.mbuf(idx[0]); ok {
+			m.SetLen(0)
+			return m, nil
+		}
+		p.bad.Add(1)
 	}
-	m := Mbuf{p: p, idx: uint32(idx[0])}
-	m.SetLen(0)
-	return m, nil
+	return Mbuf{}, ErrPoolEmpty
 }
 
 // GetBurst fills out with free buffers and returns how many it got.
 func (p *Pool) GetBurst(out []Mbuf) int {
 	idx := make([]uint64, len(out))
 	n := p.free.Dequeue(idx)
-	for i := 0; i < n; i++ {
-		out[i] = Mbuf{p: p, idx: uint32(idx[i])}
-		out[i].SetLen(0)
+	got := 0
+	for _, i := range idx[:n] {
+		m, ok := p.mbuf(i)
+		if !ok {
+			p.bad.Add(1)
+			continue
+		}
+		m.SetLen(0)
+		out[got] = m
+		got++
 	}
-	return n
+	return got
 }
 
 // Put returns buffers to the pool.
@@ -174,9 +208,21 @@ func (p *Pool) Put(ms ...Mbuf) {
 	for _, m := range ms {
 		idx = append(idx, uint64(m.idx))
 	}
-	for len(idx) > 0 {
+	// The free ring has room for every buffer, so an honest Put only ever
+	// waits for a concurrent consumer to commit. If it stays full, the extra
+	// indices are duplicates -- a double free, possibly from a hostile peer
+	// handing us a buffer it never owned -- and are dropped, not retried for
+	// ever.
+	for tries := 0; len(idx) > 0; tries++ {
 		n := p.free.Enqueue(idx)
 		idx = idx[n:]
+		if n == 0 {
+			if tries >= 64 || p.free.Wedged() {
+				p.dropped.Add(uint64(len(idx)))
+				return
+			}
+			runtime.Gosched()
+		}
 	}
 }
 

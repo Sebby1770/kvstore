@@ -36,6 +36,7 @@ import (
 	"errors"
 	"runtime"
 	"sync/atomic"
+	"time"
 
 	"github.com/Sebby1770/kvstore/kvgw/netstack/fabric"
 )
@@ -62,6 +63,56 @@ type Ring struct {
 	prodHead, prodTail, consHead, consTail *uint64
 	slots                                  []uint64
 	size, mask                             uint64
+
+	// peerTimeout bounds how long an operation waits on the other parties'
+	// progress (their commits, or a consistent snapshot of the indices).
+	// Zero -- the default, for rings private to this process -- waits for
+	// ever, which is correct when every party is our own code. A ring
+	// shared with another process cannot trust that process to commit: a
+	// peer that reserves slots and stops (dead or hostile) would otherwise
+	// hang every later operation, so shared rings set a bound and, once it
+	// is exceeded, report the ring wedged.
+	peerTimeout time.Duration
+	wedged      atomic.Bool
+}
+
+// ErrRingWedged reports a shared ring whose peer stopped committing (or
+// left its indices inconsistent): no further operation can succeed.
+var ErrRingWedged = errors.New("pmd: ring wedged by its peer")
+
+// SetPeerTimeout bounds waits on the other parties (see Ring.peerTimeout).
+func (q *Ring) SetPeerTimeout(d time.Duration) { q.peerTimeout = d }
+
+// Wedged reports whether a peer has wedged the ring.
+func (q *Ring) Wedged() bool { return q.wedged.Load() }
+
+// waiter paces a wait on other parties: spin, then yield, and -- on a ring
+// with a peer timeout -- give up once it has passed, wedging the ring.
+type waiter struct {
+	q     *Ring
+	spins int
+	start time.Time
+}
+
+// stuck reports whether to give up.
+func (w *waiter) stuck() bool {
+	w.spins++
+	if w.spins <= 64 {
+		return false
+	}
+	runtime.Gosched()
+	if w.q.peerTimeout <= 0 || w.spins%256 != 0 {
+		return false
+	}
+	if w.start.IsZero() {
+		w.start = time.Now()
+		return false
+	}
+	if time.Since(w.start) > w.q.peerTimeout {
+		w.q.wedged.Store(true)
+		return true
+	}
+	return false
 }
 
 // ErrRingSize reports a ring size that is not a power of two.
@@ -118,25 +169,41 @@ func (q *Ring) Len() int {
 // commit in reservation order by advancing the producer tail -- which is
 // what makes a slot visible to consumers only once it is written.
 func (q *Ring) Enqueue(vals []uint64) int {
+	if q.wedged.Load() {
+		return 0
+	}
 	var head, n uint64
+	w := waiter{q: q}
 	for {
 		head = atomic.LoadUint64(q.prodHead)
-		free := q.size - (head - atomic.LoadUint64(q.consTail))
-		n = min(uint64(len(vals)), free)
+		used := head - atomic.LoadUint64(q.consTail)
+		if used > q.size {
+			// An inconsistent snapshot: honest parties move on between
+			// the two loads and the next read is consistent; a peer can
+			// also write nonsense, which only the timeout ends.
+			if w.stuck() {
+				return 0
+			}
+			continue
+		}
+		n = min(uint64(len(vals)), q.size-used)
 		if n == 0 {
 			return 0
 		}
 		if atomic.CompareAndSwapUint64(q.prodHead, head, head+n) {
 			break
 		}
+		if w.stuck() {
+			return 0
+		}
 	}
 	for i := uint64(0); i < n; i++ {
 		atomic.StoreUint64(&q.slots[(head+i)&q.mask], vals[i])
 	}
 	// Wait for producers that reserved earlier slots to commit first.
-	for spins := 0; atomic.LoadUint64(q.prodTail) != head; spins++ {
-		if spins > 64 {
-			runtime.Gosched()
+	for atomic.LoadUint64(q.prodTail) != head {
+		if w.stuck() {
+			return 0
 		}
 	}
 	atomic.StoreUint64(q.prodTail, head+n)
@@ -145,10 +212,20 @@ func (q *Ring) Enqueue(vals []uint64) int {
 
 // Dequeue removes up to len(out) values (a burst) and returns how many.
 func (q *Ring) Dequeue(out []uint64) int {
+	if q.wedged.Load() {
+		return 0
+	}
 	var head, n uint64
+	w := waiter{q: q}
 	for {
 		head = atomic.LoadUint64(q.consHead)
 		avail := atomic.LoadUint64(q.prodTail) - head
+		if avail > q.size {
+			if w.stuck() {
+				return 0
+			}
+			continue
+		}
 		n = min(uint64(len(out)), avail)
 		if n == 0 {
 			return 0
@@ -156,13 +233,16 @@ func (q *Ring) Dequeue(out []uint64) int {
 		if atomic.CompareAndSwapUint64(q.consHead, head, head+n) {
 			break
 		}
+		if w.stuck() {
+			return 0
+		}
 	}
 	for i := uint64(0); i < n; i++ {
 		out[i] = atomic.LoadUint64(&q.slots[(head+i)&q.mask])
 	}
-	for spins := 0; atomic.LoadUint64(q.consTail) != head; spins++ {
-		if spins > 64 {
-			runtime.Gosched()
+	for atomic.LoadUint64(q.consTail) != head {
+		if w.stuck() {
+			return 0
 		}
 	}
 	atomic.StoreUint64(q.consTail, head+n)

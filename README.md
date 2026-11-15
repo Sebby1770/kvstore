@@ -84,7 +84,7 @@ table in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#22--the-autonomous-fabric
   and shared-memory regions co-located processes use with plain atomics.
 - **Userspace data plane** (`netstack/pmd`): DPDK-style rings, mbuf pools,
   poll-mode lcores and Toeplitz RSS, plus a memif shared-memory port that
-  carries KTP between processes with no syscalls and no copies (~7 ns a packet).
+  carries KTP between processes with no syscalls and no copies (under 10 ns a packet).
 - **Coordination-free state** (`runtime/causal`, `runtime/crdt`): causal
   broadcast over lossy datagrams, and delta CRDTs that converge however the
   network delivers them.
