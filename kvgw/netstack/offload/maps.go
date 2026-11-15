@@ -80,6 +80,7 @@ type ArrayMap struct {
 
 // NewArrayMap makes an array of n zeroed values of valueSize bytes.
 func NewArrayMap(name string, valueSize, n int) *ArrayMap {
+	valueSize, n = max(valueSize, 0), max(n, 0)
 	m := &ArrayMap{mapBase: mapBase{name: name, keySize: 4, valSize: valueSize, maxEntries: n, id: mapIDs.Add(1)}}
 	m.vals = make([][]byte, n)
 	for i := range m.vals {
@@ -174,6 +175,7 @@ type hashEntry struct {
 
 // NewHashMap makes a hash map.
 func NewHashMap(name string, keySize, valueSize, maxEntries int, lru bool) *HashMap {
+	keySize, valueSize, maxEntries = max(keySize, 0), max(valueSize, 0), max(maxEntries, 0)
 	return &HashMap{mapBase: mapBase{name: name, keySize: keySize, valSize: valueSize, maxEntries: maxEntries, id: mapIDs.Add(1)},
 		lru: lru, entries: map[string]*list.Element{}, order: list.New()}
 }
@@ -213,6 +215,9 @@ func (m *HashMap) updateLocked(key, value []byte, flags uint64) error {
 			return ErrMapFull
 		}
 		old := m.order.Back()
+		if old == nil { // a map with no room at all
+			return ErrMapFull
+		}
 		delete(m.entries, old.Value.(*hashEntry).key)
 		m.order.Remove(old)
 	}
@@ -263,6 +268,7 @@ type AddrMap struct {
 
 // NewAddrMap makes a target table with n slots.
 func NewAddrMap(name string, n int) *AddrMap {
+	n = max(n, 0)
 	return &AddrMap{mapBase: mapBase{name: name, keySize: 4, valSize: 0, maxEntries: n, id: mapIDs.Add(1)}, addrs: make([]net.Addr, n)}
 }
 
@@ -307,6 +313,7 @@ type Packet struct {
 
 // NewQueueMap makes n queues of depth packets each.
 func NewQueueMap(name string, n, depth int) *QueueMap {
+	n, depth = max(n, 0), max(depth, 0)
 	m := &QueueMap{mapBase: mapBase{name: name, keySize: 4, maxEntries: n, id: mapIDs.Add(1)}, qs: make([]chan Packet, n)}
 	for i := range m.qs {
 		m.qs[i] = make(chan Packet, depth)

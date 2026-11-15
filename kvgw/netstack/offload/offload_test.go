@@ -532,3 +532,76 @@ func TestRandomProgramsTerminate(t *testing.T) {
 		t.Fatalf("only %d random programs verified", accepted)
 	}
 }
+
+// ---- regressions from the hostile-input audit ----
+
+// A forward jump into the second slot of a later 64-bit load is rejected:
+// exec would run the slot's immediate as an instruction.
+func TestVerifierRejectsJumpIntoLaterLoadSlot(t *testing.T) {
+	insns := []Insn{
+		{Op: ClassJMP | uint8(Jne) | srcK, Dst: R1, Imm: 0, Off: 1}, // -> pc 2, the second slot
+		{Op: opLdImm64, Dst: R0, Imm: 7},
+		{Imm: 99},
+		{Op: ClassALU64 | uint8(Mov) | srcK, Dst: R0, Imm: XDPPass},
+		{Op: ClassJMP | uint8(exit)},
+	}
+	if err := (&Program{Insns: insns}).Verify(); err == nil || !strings.Contains(err.Error(), "middle of a 64-bit load") {
+		t.Fatalf("verifier accepted a jump into a load's second slot: %v", err)
+	}
+}
+
+// Verdict statistics stay bounded whatever r0 a program returns.
+func TestVerdictStatsBounded(t *testing.T) {
+	b := NewBuilder().
+		Load(DW, R2, R1, CtxData).Load(DW, R3, R1, CtxDataEnd).
+		MovReg(R4, R2).ALU64Imm(Add, R4, 4).JumpReg(Jgt, R4, R3, "short").
+		Load(W, R0, R2, 0).Exit().
+		Label("short").Return(XDPPass)
+	l, err := Load(&Program{Insns: b.MustBuild()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkt := make([]byte, 4)
+	for i := 0; i < 10000; i++ {
+		binary.LittleEndian.PutUint32(pkt, uint32(i)+100)
+		l.Run(&Input{Packet: pkt, Now: 1})
+	}
+	if n := len(l.Stats().Verdicts); n > 6 {
+		t.Fatalf("verdict map grew to %d keys", n)
+	}
+}
+
+// Degenerate map configurations and nil map slots fail safely.
+func TestDegenerateMapsAreSafe(t *testing.T) {
+	for name, maps := range map[string][]Map{"nil": {nil}, "typed nil": {(*HashMap)(nil)}} {
+		if err := (&Program{Insns: NewBuilder().Return(XDPPass).MustBuild(), Maps: maps}).Verify(); err == nil {
+			t.Errorf("%s map slot accepted", name)
+		}
+	}
+	update := NewBuilder().
+		StoreImm(DW, R10, -8, 1).StoreImm(DW, R10, -16, 2).
+		LoadMap(R1, 0).MovReg(R2, R10).ALU64Imm(Add, R2, -8).
+		MovReg(R3, R10).ALU64Imm(Add, R3, -16).Mov(R4, 0).
+		Call(HelperMapUpdate).Return(XDPPass)
+	for name, m := range map[string]Map{
+		"LRU with no room":   NewHashMap("lru0", 8, 8, 0, true),
+		"negative key size":  NewHashMap("neg", -1, 8, 4, false),
+		"negative val size":  NewHashMap("negv", 8, -5, 4, true),
+		"negative array len": NewArrayMap("arr", 8, -3),
+	} {
+		l, err := Load(&Program{Insns: update.MustBuild(), Maps: []Map{m}})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Errorf("%s: run panicked: %v", name, p)
+				}
+			}()
+			l.Run(&Input{Packet: []byte{1}, Now: 1})
+		}()
+	}
+	NewAddrMap("a", -1)
+	NewQueueMap("q", -1, -1)
+}

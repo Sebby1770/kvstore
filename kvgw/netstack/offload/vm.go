@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"reflect"
 	"sort"
 	"sync"
 )
@@ -59,6 +60,11 @@ const allRegs = 1<<11 - 1
 // package documentation for what it proves and what the interpreter checks
 // at run time instead.
 func (p *Program) Verify() error {
+	for i, m := range p.Maps {
+		if isNilMap(m) {
+			return &VerifyError{0, fmt.Sprintf("map %d is nil", i)}
+		}
+	}
 	n := len(p.Insns)
 	if n == 0 || n > MaxInsns {
 		return &VerifyError{0, fmt.Sprintf("program has %d instructions (1..%d)", n, MaxInsns)}
@@ -69,6 +75,15 @@ func (p *Program) Verify() error {
 	init := make([]uint16, n)
 	reached := make([]bool, n)
 	second := make([]bool, n) // second slot of an LD_IMM64
+	// Mark every second slot before the walk: a forward jump can target the
+	// second slot of a load the walk has not reached yet, and exec would run
+	// that slot's immediate as an instruction.
+	for pc := 0; pc+1 < n; pc++ {
+		if p.Insns[pc].Op == opLdImm64 {
+			second[pc+1] = true
+			pc++
+		}
+	}
 	init[0], reached[0] = 1<<R1|1<<R10, true
 	flow := func(from, to int, regs uint16) error {
 		if to >= n {
@@ -122,7 +137,7 @@ func (p *Program) Verify() error {
 			switch in.Src {
 			case 0:
 			case pseudoMapFD:
-				if in.Imm < 0 || int(in.Imm) >= len(p.Maps) || p.Maps[in.Imm] == nil {
+				if in.Imm < 0 || int(in.Imm) >= len(p.Maps) || isNilMap(p.Maps[in.Imm]) {
 					return bad(pc, "reference to map %d, program has %d", in.Imm, len(p.Maps))
 				}
 			default:
@@ -357,6 +372,9 @@ func (r *run) region(tag uint64) []byte {
 }
 
 func (r *run) mem(addr uint64, n int, write bool) ([]byte, error) {
+	if n < 0 {
+		return nil, errFault
+	}
 	tag, off := addr>>32, addr&0xffffffff
 	if write && tag == tagCtx {
 		return nil, errFault // the context is read-only
@@ -442,7 +460,9 @@ func actionName(a int) string {
 	case XDPRedirect:
 		return "redirect"
 	}
-	return fmt.Sprintf("action_%d", a)
+	// Any other r0 counts as one bucket: r0 can be packet-derived, and a
+	// key per value would grow the stats map without bound.
+	return "invalid"
 }
 
 func (r *run) exec() (action int, steps int, err error) {
@@ -454,7 +474,10 @@ func (r *run) exec() (action int, steps int, err error) {
 		steps++
 		in := insns[pc]
 		switch in.class() {
-		case ClassLD: // LD_IMM64
+		case ClassLD: // LD_IMM64 (the only LD form the verifier admits)
+			if in.Op != opLdImm64 || pc+1 >= len(insns) {
+				return 0, steps, errFault
+			}
 			hi := insns[pc+1]
 			if in.Src == pseudoMapFD {
 				reg[in.Dst] = mkptr(tagMap, uint64(in.Imm))
@@ -708,6 +731,16 @@ func (r *run) call(helper int32, reg *[11]uint64) error {
 		return errFault
 	}
 	return nil
+}
+
+// isNilMap reports a nil interface or a typed nil pointer in it (Load and
+// every helper call would dereference it).
+func isNilMap(m Map) bool {
+	if m == nil {
+		return true
+	}
+	v := reflect.ValueOf(m)
+	return v.Kind() == reflect.Pointer && v.IsNil()
 }
 
 // MAC64 is HelperMAC64's function: the first 8 bytes (little-endian) of
