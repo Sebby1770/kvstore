@@ -18,6 +18,13 @@
 // at the current capacity (GC without grow). Inserts that would return KV_FULL
 // double capacity via rehash and retry once.
 
+// The engine is POSIX.1-2008 code (ftruncate, mmap, msync) compiled as strict
+// ISO C11 (-std=c11). Strict mode hides POSIX declarations in glibc's headers
+// unless a feature-test macro asks for them, and GCC 14 turned the resulting
+// implicit declarations from a warning into an error. It must precede every
+// include.
+#define _POSIX_C_SOURCE 200809L
+
 #include "kvengine.h"
 
 #include <fcntl.h>

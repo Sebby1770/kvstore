@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/Sebby1770/kvstore/kvgw/netstack/endpoint"
+	"github.com/Sebby1770/kvstore/kvgw/netstack/ktp"
 )
 
 // ClientOptions tunes a Client.
@@ -23,12 +26,19 @@ type ClientOptions struct {
 	// doubling).
 	Retries int
 	Backoff time.Duration
+	// PressureProbe bounds how long a call waits for credit from a server
+	// that reported none before going ahead anyway (default 1s).
+	PressureProbe time.Duration
 }
 
 // Client makes calls over an endpoint, sharing one connection per peer.
 type Client struct {
 	ep   *endpoint.Endpoint
 	opts ClientOptions
+
+	pmu     sync.Mutex
+	credits map[*endpoint.Conn]*creditState
+	pstats  PressureStats
 }
 
 // NewClient returns a client using ep for connections.
@@ -42,13 +52,19 @@ func NewClient(ep *endpoint.Endpoint, opts ClientOptions) *Client {
 	if opts.Backoff <= 0 {
 		opts.Backoff = 50 * time.Millisecond
 	}
-	return &Client{ep: ep, opts: opts}
+	if opts.PressureProbe <= 0 {
+		opts.PressureProbe = time.Second
+	}
+	return &Client{ep: ep, opts: opts, credits: map[*endpoint.Conn]*creditState{}}
 }
 
 // CallOption modifies one call.
 type CallOption func(*callOpts)
 
-type callOpts struct{ idempotent bool }
+type callOpts struct {
+	idempotent bool
+	demand     int
+}
 
 // Idempotent marks a call safe to retry when the peer is Unavailable.
 func Idempotent() CallOption { return func(o *callOpts) { o.idempotent = true } }
@@ -82,7 +98,7 @@ func (c *Client) do(ctx context.Context, addr, method string, req []byte, opts [
 	}
 	backoff := c.opts.Backoff
 	for attempt := 0; ; attempt++ {
-		err, sent := c.once(ctx, addr, method, req, recv)
+		err, sent := c.once(ctx, addr, method, req, recv, o)
 		if err == nil || CodeOf(err) != Unavailable || attempt >= c.opts.Retries || (sent && !o.idempotent) {
 			return err
 		}
@@ -113,7 +129,7 @@ func ctxErr(ctx context.Context) error {
 
 // once makes one attempt. sent reports whether the request may have reached
 // the server (after which only idempotent calls are retried).
-func (c *Client) once(ctx context.Context, addr, method string, payload []byte, recv func([]byte) error) (err error, sent bool) {
+func (c *Client) once(ctx context.Context, addr, method string, payload []byte, recv func([]byte) error, o callOpts) (err error, sent bool) {
 	if err := ctx.Err(); err != nil {
 		return ctxErr(ctx), false
 	}
@@ -124,8 +140,14 @@ func (c *Client) once(ctx context.Context, addr, method string, payload []byte, 
 		}
 		return &Error{Code: Unavailable, Message: "connect " + addr + ": " + err.Error()}, false
 	}
+	hello(conn)
+	undo, err := c.admit(ctx, conn)
+	if err != nil {
+		return err, false
+	}
 	st, err := conn.OpenStream(ctx)
 	if err != nil {
+		undo()
 		if ctx.Err() != nil {
 			return ctxErr(ctx), false
 		}
@@ -149,6 +171,11 @@ func (c *Client) once(ctx context.Context, addr, method string, payload []byte, 
 	}
 	for k, v := range OutgoingMetadata(ctx) {
 		md[k] = v
+	}
+	var grant *demandGrant
+	if o.demand > 0 {
+		md[metaDemand] = strconv.Itoa(o.demand)
+		grant = &demandGrant{window: uint64(o.demand), granted: uint64(o.demand)}
 	}
 	if len(md) > 0 {
 		req.md = md
@@ -187,6 +214,11 @@ func (c *Client) once(ctx context.Context, addr, method string, payload []byte, 
 				st.Reset(uint64(ErrCode))
 				st.CancelRead(uint64(ErrCode))
 				return err, true
+			}
+			if grant != nil {
+				if n, send := grant.consumed(); send {
+					conn.SendPressure(ktp.Pressure{Stream: true, StreamID: st.ID(), Credits: n})
+				}
 			}
 		case kindEnd:
 			st.Close()

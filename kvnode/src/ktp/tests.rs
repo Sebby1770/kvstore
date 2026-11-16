@@ -152,6 +152,8 @@ fn fixed_frames() -> Vec<(&'static str, Frame)> {
         ("connection_close", Frame::ConnectionClose { code: 0x0a, reason: b"protocol violation".to_vec() }),
         ("handshake_done", Frame::HandshakeDone),
         ("datagram", Frame::Datagram(b"dgram".to_vec())),
+        ("app_pressure", Frame::AppPressure { stream: None, seq: 7, credits: 300, load: 875, queue: 12 }),
+        ("app_pressure_stream", Frame::AppPressure { stream: Some(9), seq: 1 << 20, credits: 64, load: 0, queue: 0 }),
     ]
 }
 

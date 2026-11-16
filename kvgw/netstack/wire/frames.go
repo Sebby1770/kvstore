@@ -19,6 +19,7 @@ const (
 	TypeConnectionClose   = 0x1c
 	TypeHandshakeDone     = 0x1e
 	TypeDatagram          = 0x30
+	TypeAppPressure       = 0x31
 )
 
 // MaxAckRanges bounds the ranges in one ACK frame; a receiver tracking more
@@ -96,6 +97,34 @@ type HandshakeDone struct{}
 
 // Datagram is an unreliable application datagram.
 type Datagram struct{ Data []byte }
+
+// MaxLoad is the largest AppPressure.Load (permille: 1000 = saturated).
+const MaxLoad = 1000
+
+// AppPressure is application-level backpressure carried in the transport:
+// where MAX_DATA / MAX_STREAM_DATA say how many *bytes* the receiver's
+// buffers can take, APP_PRESSURE says how much *work* the receiving
+// application can take -- free worker slots, queue depth, utilisation -- so a
+// sender can throttle its own execution loop before requests pile up in
+// network buffers that the receiver's thread pool cannot drain anyway.
+//
+// Connection-scoped (Stream false), it describes the sender's request
+// handling as a whole (Credits = calls it will admit now). Stream-scoped, it
+// is Reactive Streams demand for one stream: Credits is the cumulative number
+// of messages the sender is willing to receive on that stream, a high-water
+// mark (like MAX_STREAM_DATA, but counted in messages) so that a
+// retransmitted or reordered frame can never grant demand twice.
+//
+// Seq orders frames of one scope: receivers keep the highest Seq and ignore
+// older ones, so a late retransmission cannot roll the state back.
+type AppPressure struct {
+	Stream   bool
+	StreamID uint64
+	Seq      uint64
+	Credits  uint64
+	Load     uint64 // permille of capacity in use, 0..MaxLoad
+	Queue    uint64 // requests waiting for a worker
+}
 
 func (f Padding) Append(b []byte) []byte {
 	for i := 0; i < f.N; i++ {
@@ -248,6 +277,28 @@ func (f Datagram) Append(b []byte) []byte {
 func (f Datagram) Len() int           { return 1 + VarintLen(uint64(len(f.Data))) + len(f.Data) }
 func (f Datagram) AckEliciting() bool { return true }
 
+func (f AppPressure) Append(b []byte) []byte {
+	b = append(b, TypeAppPressure)
+	if f.Stream {
+		b = append(b, 1)
+		b = AppendVarint(b, f.StreamID)
+	} else {
+		b = append(b, 0)
+	}
+	b = AppendVarint(b, f.Seq)
+	b = AppendVarint(b, f.Credits)
+	b = AppendVarint(b, f.Load)
+	return AppendVarint(b, f.Queue)
+}
+func (f AppPressure) Len() int {
+	n := 2 + VarintLen(f.Seq) + VarintLen(f.Credits) + VarintLen(f.Load) + VarintLen(f.Queue)
+	if f.Stream {
+		n += VarintLen(f.StreamID)
+	}
+	return n
+}
+func (f AppPressure) AckEliciting() bool { return true }
+
 // parser walks a payload.
 type parser struct {
 	b   []byte
@@ -346,6 +397,8 @@ func (p *parser) frame() (Frame, error) {
 		f = HandshakeDone{}
 	case t == TypeDatagram:
 		f = Datagram{Data: p.bytes(p.varint())}
+	case t == TypeAppPressure:
+		f = p.appPressure()
 	default:
 		if p.err != nil {
 			return nil, p.err
@@ -356,6 +409,26 @@ func (p *parser) frame() (Frame, error) {
 		return nil, p.err
 	}
 	return f, nil
+}
+
+func (p *parser) appPressure() Frame {
+	flags := p.bytes(1)
+	if p.err != nil {
+		return nil
+	}
+	if flags[0] > 1 {
+		p.err = ErrFrame
+		return nil
+	}
+	var f AppPressure
+	if flags[0] == 1 {
+		f.Stream, f.StreamID = true, p.varint()
+	}
+	f.Seq, f.Credits, f.Load, f.Queue = p.varint(), p.varint(), p.varint(), p.varint()
+	if p.err == nil && f.Load > MaxLoad {
+		p.err = ErrFrame
+	}
+	return f
 }
 
 func (p *parser) ack() Frame {

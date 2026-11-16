@@ -60,7 +60,7 @@ func randomFrame(rng *rand.Rand) Frame {
 		return b
 	}
 	v := func() uint64 { return rng.Uint64N(1 << uint(rng.IntN(62)+1)) }
-	switch rng.IntN(14) {
+	switch rng.IntN(15) {
 	case 0:
 		return Ping{}
 	case 1:
@@ -97,6 +97,12 @@ func randomFrame(rng *rand.Rand) Frame {
 		return ConnectionClose{Code: v(), Reason: string(data())}
 	case 12:
 		return HandshakeDone{}
+	case 13:
+		p := AppPressure{Seq: v(), Credits: v(), Load: rng.Uint64N(MaxLoad + 1), Queue: v()}
+		if rng.IntN(2) == 0 {
+			p.Stream, p.StreamID = true, v()
+		}
+		return p
 	default:
 		return Datagram{Data: data()}
 	}
@@ -200,4 +206,25 @@ func FuzzParseFrames(f *testing.F) {
 			t.Fatalf("re-encoded frames do not parse: %v", err)
 		}
 	})
+}
+
+func TestAppPressureRejectsBadFields(t *testing.T) {
+	good := AppPressure{Stream: true, StreamID: 4, Seq: 9, Credits: 3, Load: 500, Queue: 2}.Append(nil)
+	if _, err := ParseFrames(good); err != nil {
+		t.Fatalf("good frame: %v", err)
+	}
+	badFlags := append([]byte(nil), good...)
+	badFlags[1] = 2
+	if _, err := ParseFrames(badFlags); err == nil {
+		t.Fatal("unknown flag bits accepted")
+	}
+	overLoad := AppPressure{Load: MaxLoad + 1}.Append(nil)
+	if _, err := ParseFrames(overLoad); err == nil {
+		t.Fatal("load above 1000 permille accepted")
+	}
+	for i := 1; i < len(good); i++ {
+		if _, err := ParseFrames(good[:i]); err == nil {
+			t.Fatalf("truncated frame (%d of %d bytes) accepted", i, len(good))
+		}
+	}
 }

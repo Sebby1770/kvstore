@@ -88,13 +88,19 @@ type Server struct {
 	stream       map[string]StreamHandler
 	interceptors []Interceptor
 	stats        map[string]*MethodStats
+
+	adm *admission
 }
 
 // NewServer returns an empty server.
 func NewServer() *Server {
 	return &Server{MaxMessage: DefaultMaxMessage, unary: map[string]Handler{},
-		stream: map[string]StreamHandler{}, stats: map[string]*MethodStats{}}
+		stream: map[string]StreamHandler{}, stats: map[string]*MethodStats{}, adm: newAdmission()}
 }
+
+// Close stops the server's pressure broadcaster (if Limits started one).
+// Connections being served are not closed; that is the endpoint's job.
+func (s *Server) Close() { s.adm.close() }
 
 // Register adds a unary method.
 func (s *Server) Register(method string, h Handler) {
@@ -186,11 +192,14 @@ func (s *Server) Serve(ctx context.Context, ep *endpoint.Endpoint) error {
 
 // ServeConn serves every stream the peer opens on c.
 func (s *Server) ServeConn(ctx context.Context, c *endpoint.Conn) {
+	s.adm.track(c)
+	defer s.adm.untrack(c)
 	for {
 		st, err := c.AcceptStream(ctx)
 		if err != nil {
 			return
 		}
+		s.adm.arrived(c)
 		go s.serveStream(ctx, c, st)
 	}
 }
@@ -199,6 +208,7 @@ func (s *Server) serveStream(parent context.Context, c *endpoint.Conn, st *endpo
 	r := bufio.NewReader(st)
 	req, err := readRequest(r, s.MaxMessage)
 	if err != nil {
+		s.adm.abandon()
 		st.Write(errFrame(toError(fmt.Errorf("bad request: %w", err))))
 		st.Close()
 		st.CancelRead(0)
@@ -223,16 +233,30 @@ func (s *Server) serveStream(parent context.Context, c *endpoint.Conn, st *endpo
 		}
 	}()
 
+	// Admission: wait for a handler slot (or be turned away). Pressure
+	// updates tell clients about the change before they send more.
+	release, err := s.adm.acquire(ctx)
+	if err != nil {
+		st.Write(errFrame(toError(err)))
+		st.Close()
+		return
+	}
+	defer release()
+
+	var demand *serverDemand
+	if n, ok := parseDemand(req.md); ok {
+		demand = &serverDemand{conn: c, stream: st.ID(), granted: n}
+	}
 	s.begin(req.method)
 	start := time.Now()
 	w := bufio.NewWriter(st)
-	failed := s.dispatch(ctx, req, w)
+	failed := s.dispatch(ctx, req, w, demand)
 	w.Flush()
 	st.Close()
 	s.end(req.method, time.Since(start), failed)
 }
 
-func (s *Server) dispatch(ctx context.Context, req request, w *bufio.Writer) (failed bool) {
+func (s *Server) dispatch(ctx context.Context, req request, w *bufio.Writer, demand *serverDemand) (failed bool) {
 	defer func() {
 		if p := recover(); p != nil {
 			w.Write(errFrame(&Error{Code: Internal, Message: fmt.Sprintf("handler panicked: %v", p)}))
@@ -274,6 +298,11 @@ func (s *Server) dispatch(ctx context.Context, req request, w *bufio.Writer) (fa
 			}
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			if demand != nil {
+				if err := demand.wait(ctx); err != nil {
+					return err
+				}
 			}
 			if _, err := w.Write(appendFrame(nil, kindData, b)); err != nil {
 				return err

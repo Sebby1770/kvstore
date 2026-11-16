@@ -3,6 +3,63 @@
 All notable changes to KVStore are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.2.0] — 2026-11-09
+
+The autonomous fabric: the mesh predicts failure and acts on it, runs network
+functions in its data path, and gains one-sided memory, kernel-bypass
+transport, coordination-free state, speculation, multipath, disciplined
+clocks and application backpressure.
+
+### Added
+
+- `runtime/foresight`: failure prediction from per-link telemetry. It runs an
+  online LSTM (gradient-checked BPTT + Adam) ensembled with a trend forecast,
+  a φ-accrual detector, and Mamdani fuzzy inference with hysteresis and a hung
+  flag. kvmesh moves actors off peers forecast to fail, and a leader whose
+  links are failing hands over (`/mesh/foresight`).
+- `netstack/offload`: eBPF bytecode (kernel encoding and helpers) with a
+  verifier, a bounds-checking interpreter, maps (array, LRU hash, DEVMAP-like,
+  XSKMAP-like) and an XDP/TC-style endpoint hook (`endpoint.SetFilter`). It
+  ships a distributed rate limiter, a circuit breaker, a heartbeat responder
+  that reports host staleness, and a Maglev load balancer with encapsulated
+  direct server return (`endpoint.TrustEncapsulation`). kvmesh:
+  `--rate-limit`, `--circuit-breaker`, `/mesh/offload`.
+- `netstack/fabric`: registered regions, global pointers, and
+  READ/WRITE/CAS/FETCH_ADD/CHASE verbs served in the packet path with rkeys,
+  permissions and a response cache for retries. `fabric.Index` is a remote
+  lock-free hash index; `fabric.MapFile` gives shared memory between
+  processes. kvmesh: a gossiped index per node, `PUT /fabric/{key}`,
+  `GET /fabric/{member}/{key}`, `--fabric-region`.
+- `netstack/pmd`: rte_ring-style MPMC rings, mbuf pools, poll-mode lcores,
+  Toeplitz RSS, a memif shared-memory port (zero-copy, syscall-free, works
+  across processes), a SocketPort, and a `net.PacketConn` adapter that runs
+  KTP over any port.
+- `runtime/causal` and `runtime/crdt`: causal broadcast over unreliable
+  datagrams with anti-entropy and matrix-clock garbage collection, and delta
+  CRDTs (PN-counter, LWW register, MV register, add-wins OR-set). kvmesh:
+  `/replica/{kind}/{name}`, bootstrapped from a peer's snapshot.
+- `runtime/speculate`: hedged execution ranked by gossiped load digests,
+  under a budget, with epidemic cancellation and late-copy refusal. kvmesh:
+  `GET /spec/kv/{key}`, `/mesh/spec`.
+- `netstack/multipath` and `netstack/segroute`: MPTCP-style sessions (ECF,
+  MinRTT, round-robin and redundant schedulers, data ACKs as datagrams,
+  stall reinjection, identity-checked joins) and SRv6-style source routing
+  with relays that learn the reverse path.
+- `runtime/vtime`: PTP-style clock discipline with provable error intervals,
+  BMCA grandmaster election, matrix clocks, a watermark sequencer, and
+  commit-wait. kvmesh's HLC reads the disciplined clock (`/mesh/time`).
+- KTP `APP_PRESSURE` frame (0x31) and `endpoint` pressure APIs.
+  `rpc.Server.SetLimits` adds a worker pool with cumulative call credits, and
+  callers block at the limit. `rpc.Demand(n)` adds Reactive Streams demand
+  for streaming calls. kvmesh: `--rpc-concurrency`, `/mesh/pressure`.
+- `endpoint.HandleDatagrams` and `endpoint.HandleRaw` route datagrams to
+  handlers by their first byte; `endpoint.Lookup` and `endpoint.WriteRaw`.
+
+### Changed
+
+- kvnode parses and ignores `APP_PRESSURE`; the Go↔Rust vectors pin the
+  frame.
+
 ## [2.1.0] — 2026-11-08
 
 The storage tier is encrypted: kvnode speaks KTP natively, through a second,

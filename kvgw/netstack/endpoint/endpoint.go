@@ -83,10 +83,18 @@ type Endpoint struct {
 
 	acceptCh chan *Conn
 	rawCh    chan RawPacket
-	wake     chan struct{}
-	done     chan struct{}
-	wg       sync.WaitGroup
-	buf      []byte
+
+	// tagged handlers (see handlers.go); read without e.mu
+	hmu        sync.RWMutex
+	dgHandlers [256]DatagramHandler
+	rawHandler [256]RawHandler
+	filter     PacketFilter
+	trustEncap map[string]bool
+	fstats     FilterStats
+	wake       chan struct{}
+	done       chan struct{}
+	wg         sync.WaitGroup
+	buf        []byte
 
 	stats EndpointStats
 }
@@ -195,7 +203,10 @@ func (e *Endpoint) readLoop() {
 			e.logf("endpoint: read: %v", err)
 			continue
 		}
-		e.handleDatagram(append([]byte(nil), buf[:n]...), addr)
+		pkt := append([]byte(nil), buf[:n]...)
+		if pkt, addr = e.ingress(pkt, addr); pkt != nil {
+			e.handleDatagram(pkt, addr)
+		}
 	}
 }
 
@@ -250,6 +261,15 @@ func (e *Endpoint) handleDatagram(pkt []byte, from net.Addr) {
 		payload, err := ktp.OpenRaw(e.cfg, pkt)
 		if err != nil {
 			return
+		}
+		if len(payload) > 0 {
+			if rh := e.rawHandlerFor(payload[0]); rh != nil {
+				e.mu.Lock()
+				e.stats.RawIn++
+				e.mu.Unlock()
+				rh(from.String(), payload)
+				return
+			}
 		}
 		select {
 		case e.rawCh <- RawPacket{From: from.String(), Payload: payload}:
@@ -313,19 +333,25 @@ func (e *Endpoint) resetLocked(h wire.Header, to net.Addr, now time.Time) {
 	}
 	e.resets++
 	e.stats.ResetsSent++
-	e.pc.WriteTo(ktp.StatelessReset(e.cfg, h), to)
+	e.write(ktp.StatelessReset(e.cfg, h), to)
 }
 
 // flushLocked sends everything c has queued, processes its events, wakes its
 // waiters, and forgets it once it is fully closed.
 func (e *Endpoint) flushLocked(c *Conn) {
+	for e.flushOnceLocked(c) {
+		// A datagram handler queued replies: send them too.
+	}
+}
+
+func (e *Endpoint) flushOnceLocked(c *Conn) (again bool) {
 	now := time.Now()
 	for {
 		n := c.kc.Poll(e.buf, now)
 		if n == 0 {
 			break
 		}
-		if _, err := e.pc.WriteTo(e.buf[:n], c.addr); err != nil {
+		if _, err := e.write(e.buf[:n], c.addr); err != nil {
 			e.logf("endpoint: write to %s: %v", c.addrStr, err)
 		}
 	}
@@ -357,6 +383,8 @@ func (e *Endpoint) flushLocked(c *Conn) {
 			}
 		case ktp.EventStreamOpened:
 			c.acceptQ = append(c.acceptQ, ev.Stream)
+		case ktp.EventDatagram:
+			again = e.dispatchDatagramsLocked(c) || again
 		case ktp.EventClosed:
 			c.markDone(c.kc.Err())
 		}
@@ -369,6 +397,7 @@ func (e *Endpoint) flushLocked(c *Conn) {
 	}
 	c.broadcast()
 	e.kick()
+	return again
 }
 
 func (e *Endpoint) forgetLocked(c *Conn) {
@@ -486,7 +515,7 @@ func (e *Endpoint) SendRaw(addr string, payload []byte) error {
 	e.mu.Lock()
 	e.stats.RawOut++
 	e.mu.Unlock()
-	_, err = e.pc.WriteTo(pkt, a)
+	_, err = e.write(pkt, a)
 	return err
 }
 

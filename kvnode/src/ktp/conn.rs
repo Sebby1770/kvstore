@@ -645,6 +645,9 @@ impl Conn {
                 return Err(CloseError::local(CODE_PROTOCOL_VIOLATION, "HANDSHAKE_DONE sent to a server"))
             }
             Frame::Datagram(_) => {} // kvnode has no use for datagrams
+            // Application backpressure describes a peer's worker pool; kvnode
+            // serves each stream as it comes and has nothing to throttle.
+            Frame::AppPressure { .. } => {}
             _ => return Err(CloseError::local(CODE_PROTOCOL_VIOLATION, "protocol violation")),
         }
         Ok(())
